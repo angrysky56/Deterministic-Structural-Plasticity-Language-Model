@@ -336,17 +336,32 @@ class Config:
 
     # Data / optimisation.
     seq_len: int = 2048  # SSM gives real long context (was 256)
-    batch_size: int = 8
-    grad_accum: int = 8  # effective batch 64
+    # A100 has plenty of room. The memory ceiling is the logits tensor
+    # (batch*seq*vocab); 24 fits a 40GB A100 with checkpointing on. Lower to
+    # 4-8 on a 12GB card. grad_accum trades update frequency for effective batch.
+    batch_size: int = 24
+    grad_accum: int = 4  # effective batch 96
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
-    min_lr_ratio: float = 0.1  # cosine floor as a fraction of lr
+    min_lr_ratio: float = 0.1  # LR floor at the end of the final decay
+    # WSD schedule: warmup -> stable plateau at full LR -> decay only over the
+    # final fraction of training. Keeps every curriculum phase at full LR
+    # (cosine-over-whole-run otherwise starves the later physics/philosophy
+    # phases). decay_frac is the tail portion spent decaying.
+    decay_frac: float = 0.2
 
     # Curriculum.
-    steps_per_substep: int = 500
+    steps_per_substep: int = 500  # try 3000+ for a real run (see token math note)
     log_every: int = 100
+    save_every: int = 500  # also checkpoint every N optimizer steps (crash safety)
+
+    # Held-out evaluation: hold out the first eval_docs rows of each dataset
+    # (train skips them), pack a few blocks each, and report eval loss at every
+    # checkpoint to distinguish generalisation from memorisation.
+    eval_docs: int = 200
+    eval_blocks_per: int = 3
     # Chat template is always applied (teaches User/Assistant turn structure).
     # Prompt-masking is OFF by default: for a from-scratch base model you want
     # every token to teach, and long formal prompts otherwise leave whole packed
@@ -362,9 +377,10 @@ class Config:
     # of the curriculum — formal reasoning, then course/textbook material.
     #
     #   logic      reasoning-core/procedural-pretraining-pile  ~7.3GB  formal, correct-by-design
-    #   math       cosmopedia/khanacademy                      ~108MB  Khan Academy course prose
+    #   math       microsoft/orca-math-word-problems-200k      ~225MB  200k math word-problem Q&A
     #   physics    cosmopedia/openstax                         ~668MB  OpenStax textbooks (incl. Univ. Physics)
     #   philosophy sayhan/strix-philosophy-qa                  ~391MB  134k philosophy Q&A
+    #   qa         yahma/alpaca-cleaned                        ~40MB   51k general instruction Q&A
     #
     # Streaming means pool size barely matters — you only pull what
     # steps*batch*seq_len demands. Scale-up swaps (bigger, still non-gated):
@@ -373,9 +389,10 @@ class Config:
     repos: dict = field(
         default_factory=lambda: {
             "logic": ("reasoning-core/procedural-pretraining-pile", None),
-            "math": ("HuggingFaceTB/cosmopedia", "khanacademy"),
+            "math": ("microsoft/orca-math-word-problems-200k", None),
             "physics": ("HuggingFaceTB/cosmopedia", "openstax"),
             "philosophy": ("sayhan/strix-philosophy-qa", None),
+            "qa": ("yahma/alpaca-cleaned", None),
         }
     )
 
@@ -406,17 +423,34 @@ def make_formatters():
         response = "\n".join(s for s in (c, a) if isinstance(s, str) and s)
         return (True, p, response) if response else None
 
-    def philosophy(item):  # strix: question -> answer
+    def qa_pair(item):  # orca-math / strix: question -> answer
         q, a = item.get("question", ""), item.get("answer", "")
         if isinstance(q, str) and q and isinstance(a, str) and a:
             return (True, q, a)
         return None
 
+    def alpaca(item):  # alpaca-cleaned: instruction (+input) -> output
+        instr, inp, out = (
+            item.get("instruction", ""),
+            item.get("input", ""),
+            item.get("output", ""),
+        )
+        if not (isinstance(instr, str) and instr and isinstance(out, str) and out):
+            return None
+        prompt = f"{instr}\n{inp}" if isinstance(inp, str) and inp else instr
+        return (True, prompt, out)
+
     def prose(item):  # cosmopedia textbooks: plain continuation, no prompt
         t = item.get("text", "")
         return (False, "", t) if isinstance(t, str) and t else None
 
-    return {"logic": logic, "math": prose, "physics": prose, "philosophy": philosophy}
+    return {
+        "logic": logic,
+        "math": qa_pair,
+        "physics": prose,
+        "philosophy": qa_pair,
+        "qa": alpaca,
+    }
 
 
 def encode_example(name, item, formatters, tokenizer, mask_prompt):
@@ -573,21 +607,82 @@ def build_model_and_optim(cfg: Config, vocab_size: int, device: str):
         branch_dim=cfg.branch_dim,
         use_checkpoint=cfg.use_checkpoint,
     ).to(device)
+
+    # Weight-decay only the 2-D projection/embedding matrices. Exclude biases,
+    # LayerNorm gains (ndim < 2) and the SSM kernel poles (log_A_real, A_imag,
+    # log_dt, C) + skip D — decaying resonator parameters is harmful.
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or ".kernel." in name or name.endswith(".D"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
     optimizer = optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+        [
+            {"params": decay, "weight_decay": cfg.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=cfg.lr,
+        betas=(0.9, 0.95),
     )
     return model, optimizer
 
 
 def make_scheduler(cfg: Config, optimizer, total_steps: int):
+    """WSD: linear warmup -> stable plateau at full LR -> final decay to floor."""
+    decay_steps = int(total_steps * cfg.decay_frac)
+    stable_end = max(cfg.warmup_steps, total_steps - decay_steps)
+
     def lr_lambda(step: int) -> float:
         if step < cfg.warmup_steps:
             return (step + 1) / cfg.warmup_steps
-        progress = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
+        if step < stable_end:
+            return 1.0  # full LR for every curriculum phase
+        progress = (step - stable_end) / max(1, total_steps - stable_end)
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
         return cfg.min_lr_ratio + (1.0 - cfg.min_lr_ratio) * cosine
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per):
+    """Pack a fixed set of held-out blocks (CPU tensors) per dataset."""
+    blocks = []
+    for name, ds in eval_loaded.items():
+        mux = WeightedMultiplex([ds], [1.0], [name], seed=0)
+        stream = PackedTokenStream(
+            mux, formatters, tokenizer, seq_len, mask_prompt=False
+        )
+        for _ in range(blocks_per):
+            x, y = stream.get_block("cpu")
+            if x is None:
+                break
+            blocks.append((x, y))
+    return blocks
+
+
+@torch.no_grad()
+def evaluate(model, blocks, vocab_size, device):
+    """Mean cross-entropy over the held-out blocks."""
+    if not blocks:
+        return float("nan")
+    model.eval()
+    total, n = 0.0, 0
+    for x, y in blocks:
+        x, y = x.to(device), y.to(device)
+        if device == "cuda":
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        else:
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        total += loss.item()
+        n += 1
+    model.train()
+    return total / max(1, n)
 
 
 def smoke_test(cfg: Config, device: str) -> None:
@@ -674,16 +769,26 @@ def main() -> None:
     model, optimizer = build_model_and_optim(cfg, vocab_size, device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
-    # Robust dataset loading: drop anything that fails (e.g. gated physics).
+    # Robust dataset loading: drop anything that fails. Each dataset is split
+    # into a held-out eval set (first eval_docs rows) and a train set (the rest)
+    # so eval never overlaps training.
     formatters = make_formatters()
-    loaded = {}
+    loaded, eval_loaded = {}, {}
     for name, (repo, cfg_name) in cfg.repos.items():
         try:
-            loaded[name] = load_dataset(repo, cfg_name, split="train", streaming=True)
+            base = load_dataset(repo, cfg_name, split="train", streaming=True)
+            eval_loaded[name] = base.take(cfg.eval_docs)
+            loaded[name] = base.skip(cfg.eval_docs)
             tag = f"{repo}:{cfg_name}" if cfg_name else repo
             print(f"  loaded {name:<10} <- {tag}")
         except Exception as exc:  # gated / offline / renamed
             print(f"  SKIP  {name:<10} <- {repo}  ({type(exc).__name__}: {exc})")
+
+    print("Building held-out eval blocks...")
+    eval_blocks = build_eval_blocks(
+        eval_loaded, formatters, tokenizer, cfg.seq_len, cfg.eval_blocks_per
+    )
+    print(f"  {len(eval_blocks)} eval blocks held out")
 
     phases = [
         {
@@ -706,9 +811,9 @@ def main() -> None:
         },
         {
             "name": "Phase_4_Philosophy_Meta",
-            "desc": "Philosophy & Conceptual Analysis",
-            "datasets": ["logic", "math", "physics", "philosophy"],
-            "mixtures": [[0.25, 0.25, 0.25, 0.25]],
+            "desc": "Philosophy, Conceptual Analysis & general Q&A",
+            "datasets": ["logic", "math", "physics", "philosophy", "qa"],
+            "mixtures": [[0.2, 0.2, 0.2, 0.2, 0.2]],
         },
     ]
 
@@ -730,6 +835,13 @@ def main() -> None:
 
     print("\nStarting curriculum training...")
     substep_global = 0  # flat index across all phases, for resume skip-ahead
+    tokens_seen = 0
+
+    def sample(seed_text="The physical principles governing the universe state that"):
+        ids = tokenizer.encode(seed_text, return_tensors="pt").to(device)
+        out = model.generate(ids, max_new_tokens=40, temperature=0.8, top_k=50)
+        return tokenizer.decode(out[0], skip_special_tokens=True)
+
     for phase in phases:
         # Keep only datasets that actually loaded; renormalise the mixture.
         avail = [d for d in phase["datasets"] if d in loaded]
@@ -774,6 +886,7 @@ def main() -> None:
             streams = [stream]  # single packed stream; batch draws multiple blocks
 
             optimizer.zero_grad(set_to_none=True)
+            ema = None
             for step in range(cfg.steps_per_substep):
                 model.train()
                 x, y = get_packed_batch(streams, cfg.batch_size, device)
@@ -795,6 +908,9 @@ def main() -> None:
                     loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
 
                 (loss / cfg.grad_accum).backward()
+                tokens_seen += x.numel()
+                lv = loss.item()
+                ema = lv if ema is None else 0.95 * ema + 0.05 * lv
 
                 if (step + 1) % cfg.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -804,13 +920,22 @@ def main() -> None:
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    if cfg.save_every and global_step % cfg.save_every == 0:
+                        save_checkpoint(
+                            latest,
+                            model,
+                            optimizer,
+                            scheduler,
+                            global_step,
+                            substep_global,
+                            cfg,
+                        )
 
                 if step % cfg.log_every == 0 or step == cfg.steps_per_substep - 1:
-                    ppl = math.exp(min(20, loss.item()))
                     print(
                         f"  [{phase['name']} | sub {substep_idx + 1}] step {step:04d} "
-                        f"| loss {loss.item():.4f} | ppl {ppl:8.1f} "
-                        f"| lr {scheduler.get_last_lr()[0]:.2e}"
+                        f"| loss {lv:.4f} (ema {ema:.4f}) | ppl {math.exp(min(20, ema)):8.1f} "
+                        f"| lr {scheduler.get_last_lr()[0]:.2e} | {tokens_seen / 1e6:.1f}M tok"
                     )
 
             # Flush trailing accumulated gradients, then checkpoint.
@@ -836,7 +961,10 @@ def main() -> None:
                 latest, model, optimizer, scheduler, global_step, substep_global, cfg
             )
             tokenizer.save_pretrained(out_dir)
+            ev = evaluate(model, eval_blocks, vocab_size, device)
             print(f"  Saved checkpoint -> {out_dir}")
+            print(f"  eval loss {ev:.4f} | eval ppl {math.exp(min(20, ev)):.1f}")
+            print(f"  sample: {sample()[:200]!r}")
 
     print("\nTraining complete.")
 
