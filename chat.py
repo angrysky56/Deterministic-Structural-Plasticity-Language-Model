@@ -106,6 +106,7 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = int(1e12)  # no context cap (see training script)
     model = load_model(args.checkpoint, len(tokenizer), device)
     eos = tokenizer.eos_token_id
     # In chat mode also stop if the model starts a new "User" turn.

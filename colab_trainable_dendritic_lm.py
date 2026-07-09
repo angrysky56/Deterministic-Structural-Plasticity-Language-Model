@@ -664,6 +664,10 @@ def main() -> None:
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+    # GPT-2's tokenizer carries a legacy 1024 cap (its positional-embedding
+    # limit). This model has NO such limit — token embeddings + SSM handle any
+    # length — so raise it to silence a spurious "sequence too long" warning.
+    tokenizer.model_max_length = int(1e12)
     vocab_size = len(tokenizer)
     print(f"Vocab size: {vocab_size} tokens (GPT-2 BPE)")
 
