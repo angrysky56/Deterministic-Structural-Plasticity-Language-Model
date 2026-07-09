@@ -482,30 +482,41 @@ class WeightedMultiplex:
 
     Replaces datasets.interleave_datasets, which fails when sibling datasets
     have differently-typed columns of the same name (e.g. reasoning-core's
-    `prompt` is Arrow large_string while Cosmopedia's is string). We sample in
-    plain Python, so no cross-dataset schema alignment is attempted, and each
-    yielded row keeps its dataset name for correct formatting.
+    ``prompt`` is Arrow large_string while Cosmopedia's is string). We sample
+    in plain Python, so no cross-dataset schema alignment is attempted, and
+    each yielded row keeps its dataset name for correct formatting.
 
-    Exhausted sources are dropped and weights renormalised (~ "all_exhausted").
+    Exhausted sources are **cycled** (restarted from the top) so the training
+    mix ratio stays stable for the entire substep. A warning is printed the
+    first time each source restarts.
     """
 
     def __init__(self, iterables, weights, names, seed=3407):
-        self.iters = [iter(it) for it in iterables]
+        self._iterables = list(iterables)  # keep originals for recycling
+        self.iters = [iter(it) for it in self._iterables]
         self.weights = list(weights)
         self.names = list(names)
+        self._cycled: set[int] = set()  # indices that have been restarted
         self.rng = random.Random(seed)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        while self.iters:
-            i = self.rng.choices(range(len(self.iters)), weights=self.weights)[0]
-            try:
-                return self.names[i], next(self.iters[i])
-            except StopIteration:
-                del self.iters[i], self.weights[i], self.names[i]
-        raise StopIteration
+        if not self.iters:
+            raise StopIteration
+        i = self.rng.choices(range(len(self.iters)), weights=self.weights)[0]
+        try:
+            return self.names[i], next(self.iters[i])
+        except StopIteration:
+            # Cycle: restart from the beginning instead of dropping.
+            if i not in self._cycled:
+                print(
+                    f"    [WeightedMultiplex] cycling exhausted source '{self.names[i]}'"
+                )
+                self._cycled.add(i)
+            self.iters[i] = iter(self._iterables[i])
+            return self.names[i], next(self.iters[i])
 
 
 class PackedTokenStream:
@@ -648,24 +659,31 @@ def make_scheduler(cfg: Config, optimizer, total_steps: int):
 
 
 def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per):
-    """Pack a fixed set of held-out blocks (CPU tensors) per dataset."""
-    blocks = []
+    """Pack a fixed set of held-out blocks (CPU tensors) **per dataset**.
+
+    Returns ``dict[str, list[tuple[Tensor, Tensor]]]`` so callers can evaluate
+    on individual domains or a filtered subset.
+    """
+    blocks_by_name: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
     for name, ds in eval_loaded.items():
         mux = WeightedMultiplex([ds], [1.0], [name], seed=0)
         stream = PackedTokenStream(
             mux, formatters, tokenizer, seq_len, mask_prompt=False
         )
+        ds_blocks: list[tuple[torch.Tensor, torch.Tensor]] = []
         for _ in range(blocks_per):
             x, y = stream.get_block("cpu")
             if x is None:
                 break
-            blocks.append((x, y))
-    return blocks
+            ds_blocks.append((x, y))
+        if ds_blocks:
+            blocks_by_name[name] = ds_blocks
+    return blocks_by_name
 
 
 @torch.no_grad()
 def evaluate(model, blocks, vocab_size, device):
-    """Mean cross-entropy over the held-out blocks."""
+    """Mean cross-entropy over a flat list of held-out blocks."""
     if not blocks:
         return float("nan")
     model.eval()
@@ -683,6 +701,26 @@ def evaluate(model, blocks, vocab_size, device):
         n += 1
     model.train()
     return total / max(1, n)
+
+
+def evaluate_per_dataset(
+    model, eval_blocks_by_name, vocab_size, device, active_datasets=None
+):
+    """Eval loss per dataset and an average over the active datasets only.
+
+    ``active_datasets`` limits which datasets contribute to the reported
+    average; if *None* all datasets are included.
+    """
+    per_ds: dict[str, float] = {}
+    for name, blocks in eval_blocks_by_name.items():
+        per_ds[name] = evaluate(model, blocks, vocab_size, device)
+
+    if active_datasets is not None:
+        active_vals = [per_ds[n] for n in active_datasets if n in per_ds]
+    else:
+        active_vals = list(per_ds.values())
+    avg = sum(active_vals) / max(1, len(active_vals)) if active_vals else float("nan")
+    return per_ds, avg
 
 
 def smoke_test(cfg: Config, device: str) -> None:
@@ -785,10 +823,11 @@ def main() -> None:
             print(f"  SKIP  {name:<10} <- {repo}  ({type(exc).__name__}: {exc})")
 
     print("Building held-out eval blocks...")
-    eval_blocks = build_eval_blocks(
+    eval_blocks_by_name = build_eval_blocks(
         eval_loaded, formatters, tokenizer, cfg.seq_len, cfg.eval_blocks_per
     )
-    print(f"  {len(eval_blocks)} eval blocks held out")
+    total_blocks = sum(len(v) for v in eval_blocks_by_name.values())
+    print(f"  {total_blocks} eval blocks held out across {list(eval_blocks_by_name)}")
 
     phases = [
         {
@@ -938,10 +977,15 @@ def main() -> None:
                         f"| lr {scheduler.get_last_lr()[0]:.2e} | {tokens_seen / 1e6:.1f}M tok"
                     )
 
-            # Flush trailing accumulated gradients, then checkpoint.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            # Flush trailing accumulated gradients only if the last
+            # accumulation cycle was incomplete (avoids a spurious optimizer
+            # step with stale/partial grads that corrupts the checkpoint).
+            if step % cfg.grad_accum != cfg.grad_accum - 1:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
             substep_global += 1  # this substep is now complete
 
             out_dir = os.path.join(
@@ -961,9 +1005,20 @@ def main() -> None:
                 latest, model, optimizer, scheduler, global_step, substep_global, cfg
             )
             tokenizer.save_pretrained(out_dir)
-            ev = evaluate(model, eval_blocks, vocab_size, device)
+
+            # Per-dataset eval: report each domain + active-only average.
+            active = [d for d in phase["datasets"] if d in loaded]
+            per_ds, ev = evaluate_per_dataset(
+                model, eval_blocks_by_name, vocab_size, device, active
+            )
             print(f"  Saved checkpoint -> {out_dir}")
-            print(f"  eval loss {ev:.4f} | eval ppl {math.exp(min(20, ev)):.1f}")
+            parts = " | ".join(
+                f"{n} {per_ds[n]:.2f}" for n in sorted(per_ds) if n in per_ds
+            )
+            print(f"  eval per-dataset: {parts}")
+            print(
+                f"  eval (active avg) loss {ev:.4f} | ppl {math.exp(min(20, ev)):.1f}"
+            )
             print(f"  sample: {sample()[:200]!r}")
 
     print("\nTraining complete.")
