@@ -177,9 +177,7 @@ class ResonatorSSM(nn.Module):
         # Gated readout.
         return self.out_proj(y) * F.silu(self.gate_proj(x))
 
-    def initial_state(
-        self, batch_size: int, device: torch.device
-    ) -> torch.Tensor:
+    def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Zero-initialised SSM hidden state."""
         return self.kernel.initial_state(batch_size, device)
 
@@ -294,9 +292,7 @@ class DendriticResonatorBlock(nn.Module):
         x = x + self.dendrite(self.norm2(x))
         return x
 
-    def initial_state(
-        self, batch_size: int, device: torch.device
-    ) -> torch.Tensor:
+    def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Zero-initialised per-block SSM hidden state."""
         return self.ssm.initial_state(batch_size, device)
 
@@ -406,7 +402,7 @@ class VectorizedDendriticLM(nn.Module):
         """
         x = self.embedding(token_ids)  # (B, H)
         new_states: list[torch.Tensor] = []
-        for block, h in zip(self.blocks, states):
+        for block, h in zip(self.blocks, states, strict=False):
             x, h_new = block.step(x, h)
             new_states.append(h_new)
         logits = self.lm_head(self.norm_out(x))  # (B, vocab)
@@ -489,9 +485,9 @@ class Config:
     decay_frac: float = 0.2
 
     # Curriculum.
-    steps_per_substep: int = 500  # try 3000+ for a real run (see token math note)
+    steps_per_substep: int = 3000  # try 500+ for a trial run (see token math note)
     log_every: int = 100
-    save_every: int = 500  # also checkpoint every N optimizer steps (crash safety)
+    save_every: int = 3000  # also checkpoint every N optimizer steps (crash safety)
 
     # Held-out evaluation: hold out the first eval_docs rows of each dataset
     # (train skips them), pack a few blocks each, and report eval loss at every
@@ -511,7 +507,7 @@ class Config:
     # Hugging Face Hub: set this to auto-sync checkpoints between Colab and
     # your local machine. Format: "username/repo-name". Created as a PRIVATE
     # repo on first push. Pull locally with: python colab_trainable_dendritic_lm.py pull
-    hf_repo: str = ""  # e.g. "angrysky56/dsp-lm-checkpoints"
+    hf_repo: str = "angrysky/dendritic-lm"  # e.g. "your_hf_name/dendritic-lm"
 
     # Dataset slate: a balanced, non-gated, all-streamable "curriculum of
     # courses". Each entry is (repo, config_or_None). All four share the spirit
@@ -922,6 +918,7 @@ def smoke_test(cfg: Config, device: str) -> None:
         f"generate OK -> {tuple(gen.shape)}\n=== SMOKE TEST PASSED (model learns) ==="
     )
 
+
 # ==========================================================================
 # 8. CHECKPOINT SYNC  --  Hugging Face Hub (Colab <-> local machine)
 # ==========================================================================
@@ -987,7 +984,7 @@ def hf_clean(hf_repo: str, output_dir: str) -> None:
         shutil.rmtree(output_dir)
         print(f"  Deleted local checkpoints: {output_dir}")
     else:
-        print(f"  No local checkpoints to delete.")
+        print("  No local checkpoints to delete.")
 
     if hf_repo:
         from huggingface_hub import HfApi
@@ -997,7 +994,7 @@ def hf_clean(hf_repo: str, output_dir: str) -> None:
             HfApi().delete_repo(repo_id=hf_repo)
             print(f"  Deleted remote repo: {hf_repo}")
         except RepositoryNotFoundError:
-            print(f"  No remote repo to delete.")
+            print("  No remote repo to delete.")
 
 
 def main() -> None:
