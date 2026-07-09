@@ -505,7 +505,7 @@ class Config:
     # ON for a later dedicated SFT/instruction-polish phase.
     mask_prompt_loss: bool = False
 
-    output_dir: str = "./checkpoints/DSP_LM"
+    output_dir: str = "./checkpoints/DSP_LM"  # overridden to Google Drive on Colab
     resume: bool = True  # resume from latest checkpoint (skips finished substeps)
 
     # Dataset slate: a balanced, non-gated, all-streamable "curriculum of
@@ -918,6 +918,44 @@ def smoke_test(cfg: Config, device: str) -> None:
     )
 
 
+# ==========================================================================
+# 8. COLAB / GOOGLE DRIVE PERSISTENCE
+# ==========================================================================
+
+
+def _is_colab() -> bool:
+    """Detect whether we're running inside Google Colab."""
+    try:
+        import google.colab  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def setup_drive_checkpoint_dir(
+    drive_subdir: str = "DSP_LM_checkpoints",
+) -> str:
+    """Mount Google Drive and return a persistent checkpoint directory.
+
+    Called automatically in ``main()`` when running on Colab. The directory
+    lives under ``/content/drive/MyDrive/<drive_subdir>`` so checkpoints
+    survive runtime restarts and disconnects.
+    """
+    from google.colab import drive  # type: ignore[import-untyped]
+
+    mount_point = "/content/drive"
+    if not os.path.ismount(mount_point):
+        print("Mounting Google Drive...")
+        drive.mount(mount_point)
+    else:
+        print("Google Drive already mounted.")
+
+    ckpt_dir = os.path.join(mount_point, "MyDrive", drive_subdir)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    print(f"Checkpoints will be saved to: {ckpt_dir}")
+    return ckpt_dir
+
 def main() -> None:
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -929,6 +967,13 @@ def main() -> None:
     if os.environ.get("DSP_SMOKE") == "1":
         smoke_test(cfg, device)
         return
+
+    # On Colab, mount Google Drive so checkpoints survive runtime restarts.
+    if _is_colab():
+        cfg.output_dir = setup_drive_checkpoint_dir()
+        print(f"  (Colab detected — saving to Google Drive)")
+    else:
+        print(f"  (Local run — saving to {cfg.output_dir})")
 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
