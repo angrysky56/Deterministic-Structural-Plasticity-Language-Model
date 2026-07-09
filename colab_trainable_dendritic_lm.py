@@ -505,8 +505,13 @@ class Config:
     # ON for a later dedicated SFT/instruction-polish phase.
     mask_prompt_loss: bool = False
 
-    output_dir: str = "./checkpoints/DSP_LM"  # overridden to Google Drive on Colab
+    output_dir: str = "./checkpoints/DSP_LM"
     resume: bool = True  # resume from latest checkpoint (skips finished substeps)
+
+    # Hugging Face Hub: set this to auto-sync checkpoints between Colab and
+    # your local machine. Format: "username/repo-name". Created as a PRIVATE
+    # repo on first push. Pull locally with: python colab_trainable_dendritic_lm.py pull
+    hf_repo: str = ""  # e.g. "angrysky56/dsp-lm-checkpoints"
 
     # Dataset slate: a balanced, non-gated, all-streamable "curriculum of
     # courses". Each entry is (repo, config_or_None). All four share the spirit
@@ -917,9 +922,8 @@ def smoke_test(cfg: Config, device: str) -> None:
         f"generate OK -> {tuple(gen.shape)}\n=== SMOKE TEST PASSED (model learns) ==="
     )
 
-
 # ==========================================================================
-# 8. COLAB / GOOGLE DRIVE PERSISTENCE
+# 8. CHECKPOINT SYNC  --  Hugging Face Hub (Colab <-> local machine)
 # ==========================================================================
 
 
@@ -933,28 +937,68 @@ def _is_colab() -> bool:
         return False
 
 
-def setup_drive_checkpoint_dir(
-    drive_subdir: str = "DSP_LM_checkpoints",
-) -> str:
-    """Mount Google Drive and return a persistent checkpoint directory.
+def hf_push_checkpoint(hf_repo: str, output_dir: str) -> None:
+    """Push the checkpoint directory to a private Hugging Face Hub repo.
 
-    Called automatically in ``main()`` when running on Colab. The directory
-    lives under ``/content/drive/MyDrive/<drive_subdir>`` so checkpoints
-    survive runtime restarts and disconnects.
+    Creates the repo on first call. Subsequent calls update it in-place.
+    Requires ``huggingface-cli login`` or ``HF_TOKEN`` env var.
     """
-    from google.colab import drive  # type: ignore[import-untyped]
+    from huggingface_hub import HfApi
 
-    mount_point = "/content/drive"
-    if not os.path.ismount(mount_point):
-        print("Mounting Google Drive...")
-        drive.mount(mount_point)
+    api = HfApi()
+    api.create_repo(repo_id=hf_repo, private=True, exist_ok=True)
+    api.upload_folder(
+        repo_id=hf_repo,
+        folder_path=output_dir,
+        commit_message="checkpoint update",
+    )
+    print(f"  Pushed checkpoint to https://huggingface.co/{hf_repo}")
+
+
+def hf_pull_checkpoint(hf_repo: str, output_dir: str) -> bool:
+    """Download checkpoints from Hugging Face Hub into output_dir.
+
+    Returns True if a checkpoint was found, False otherwise.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    try:
+        snapshot_download(
+            repo_id=hf_repo,
+            local_dir=output_dir,
+            local_dir_use_symlinks=False,
+        )
+        print(f"  Pulled checkpoint from https://huggingface.co/{hf_repo}")
+        return True
+    except RepositoryNotFoundError:
+        print(f"  No remote checkpoint found at {hf_repo}")
+        return False
+    except Exception as exc:
+        print(f"  Could not pull checkpoint: {type(exc).__name__}: {exc}")
+        return False
+
+
+def hf_clean(hf_repo: str, output_dir: str) -> None:
+    """Delete local checkpoints AND the remote HF Hub repo."""
+    import shutil
+
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+        print(f"  Deleted local checkpoints: {output_dir}")
     else:
-        print("Google Drive already mounted.")
+        print(f"  No local checkpoints to delete.")
 
-    ckpt_dir = os.path.join(mount_point, "MyDrive", drive_subdir)
-    os.makedirs(ckpt_dir, exist_ok=True)
-    print(f"Checkpoints will be saved to: {ckpt_dir}")
-    return ckpt_dir
+    if hf_repo:
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import RepositoryNotFoundError
+
+        try:
+            HfApi().delete_repo(repo_id=hf_repo)
+            print(f"  Deleted remote repo: {hf_repo}")
+        except RepositoryNotFoundError:
+            print(f"  No remote repo to delete.")
+
 
 def main() -> None:
     from datasets import load_dataset
@@ -968,12 +1012,12 @@ def main() -> None:
         smoke_test(cfg, device)
         return
 
-    # On Colab, mount Google Drive so checkpoints survive runtime restarts.
-    if _is_colab():
-        cfg.output_dir = setup_drive_checkpoint_dir()
-        print(f"  (Colab detected — saving to Google Drive)")
-    else:
-        print(f"  (Local run — saving to {cfg.output_dir})")
+    # On Colab with hf_repo configured, pull latest checkpoint for resume.
+    if _is_colab() and cfg.hf_repo and cfg.resume:
+        print("Checking HF Hub for existing checkpoint...")
+        hf_pull_checkpoint(cfg.hf_repo, cfg.output_dir)
+
+    print(f"Checkpoint directory: {cfg.output_dir}")
 
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -1202,6 +1246,13 @@ def main() -> None:
             )
             print(f"  sample: {sample()[:200]!r}")
 
+            # Push to HF Hub so checkpoints survive Colab restarts.
+            if cfg.hf_repo:
+                try:
+                    hf_push_checkpoint(cfg.hf_repo, cfg.output_dir)
+                except Exception as exc:
+                    print(f"  HF push failed (non-fatal): {exc}")
+
     print("\nTraining complete.")
 
     print("\n--- Generation test ---")
@@ -1213,4 +1264,29 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1].lower()
+        cfg = Config()
+        if cmd == "pull":
+            # Download checkpoints from HF Hub into the local project.
+            if not cfg.hf_repo:
+                print("Error: set hf_repo in Config first.")
+                sys.exit(1)
+            hf_pull_checkpoint(cfg.hf_repo, cfg.output_dir)
+        elif cmd == "clean":
+            # Wipe local checkpoints AND the remote HF repo.
+            hf_clean(cfg.hf_repo, cfg.output_dir)
+        elif cmd == "push":
+            # Manually push local checkpoints to HF Hub.
+            if not cfg.hf_repo:
+                print("Error: set hf_repo in Config first.")
+                sys.exit(1)
+            hf_push_checkpoint(cfg.hf_repo, cfg.output_dir)
+        else:
+            print(f"Unknown command: {cmd}")
+            print("Usage: python colab_trainable_dendritic_lm.py [pull|push|clean]")
+            sys.exit(1)
+    else:
+        main()
