@@ -90,22 +90,60 @@ class ResonatorSSMKernel(nn.Module):
             math.pi * torch.arange(half).repeat(d_model, 1).float()
         )
 
+    def _discretise(self):
+        """Shared discretisation used by both convolutional and recurrent paths.
+
+        Returns ``(A_bar, B_bar, C)`` where:
+        - ``A_bar = exp(dt * A)`` — discrete pole (damped complex), (H, N/2)
+        - ``B_bar = (A_bar - 1) / A`` — ZOH-discretised input matrix, (H, N/2)
+        - ``C`` — readout weights (unmodified), (H, N/2)
+        """
+        dt = torch.exp(self.log_dt)  # (H,)
+        c = torch.view_as_complex(self.C)  # (H, N/2)
+        a = -torch.exp(self.log_A_real) + 1j * self.A_imag  # (H, N/2)
+        dt_a = a * dt.unsqueeze(-1)  # (H, N/2)
+        a_bar = torch.exp(dt_a)  # (H, N/2)
+        b_bar = (a_bar - 1.0) / a  # (H, N/2)
+        return a_bar, b_bar, c
+
     def forward(self, length: int) -> torch.Tensor:
         """Return the real causal kernel of shape ``(d_model, length)``."""
         # Kernel math runs in float32 (complex ops are unsupported in bf16).
-        dt = torch.exp(self.log_dt)  # (H,)
-        c = torch.view_as_complex(self.C)  # (H, N/2)
-        a = -torch.exp(self.log_A_real) + 1j * self.A_imag  # (H, N/2) stable
-
-        # Discretise: dtA = dt * A, folding (e^{dtA}-1)/A into C (B ~ ones).
-        dt_a = a * dt.unsqueeze(-1)  # (H, N/2)
-        c = c * (torch.exp(dt_a) - 1.0) / a  # (H, N/2)
+        a_bar, b_bar, c = self._discretise()
+        c_mod = c * b_bar  # fold B into C for the convolutional form
 
         # Vandermonde: powers of the discrete pole along the sequence axis.
-        arange = torch.arange(length, device=a.device)
+        dt_a = torch.log(a_bar)  # recover dt*A for exponentiation
+        arange = torch.arange(length, device=a_bar.device)
         powers = torch.exp(dt_a.unsqueeze(-1) * arange)  # (H, N/2, L)
-        kernel = 2.0 * torch.einsum("hn,hnl->hl", c, powers).real  # (H, L)
+        kernel = 2.0 * torch.einsum("hn,hnl->hl", c_mod, powers).real  # (H, L)
         return kernel
+
+    def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Zero-initialised hidden state: ``(B, H, N/2)`` complex float32."""
+        half = self.log_A_real.shape[1]
+        h = self.log_A_real.shape[0]
+        return torch.zeros(batch_size, h, half, dtype=torch.cfloat, device=device)
+
+    def step(
+        self, x_t: torch.Tensor, h: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One recurrent step (the dual of the FFT convolutional form).
+
+        Args:
+            x_t: Input token embedding, ``(B, H)`` real.
+            h:   Hidden state from the previous step, ``(B, H, N/2)`` complex.
+
+        Returns:
+            ``(y_t, h_new)`` where ``y_t`` is ``(B, H)`` real and ``h_new``
+            has the same shape as ``h``.
+        """
+        a_bar, b_bar, c = self._discretise()  # (H, N/2) each
+        # State update: h_new = A_bar * h + B_bar * x_t
+        h_new = a_bar * h + b_bar * x_t.to(torch.cfloat).unsqueeze(-1)
+        # Readout: y_t = 2 * Re(C · h_new)  (conjugate-pair reconstruction)
+        y_t = 2.0 * torch.einsum("hn,bhn->bh", c, h_new).real
+        return y_t, h_new
 
 
 class ResonatorSSM(nn.Module):
@@ -121,6 +159,7 @@ class ResonatorSSM(nn.Module):
         self.gate_proj = nn.Linear(d_model, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Convolutional (training) path: process a full sequence via FFT."""
         # x: (B, T, H) -> operate along time.
         length = x.size(1)
         u = x.transpose(1, 2)  # (B, H, T)
@@ -137,6 +176,31 @@ class ResonatorSSM(nn.Module):
 
         # Gated readout.
         return self.out_proj(y) * F.silu(self.gate_proj(x))
+
+    def initial_state(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        """Zero-initialised SSM hidden state."""
+        return self.kernel.initial_state(batch_size, device)
+
+    def step(
+        self, x_t: torch.Tensor, h: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recurrent (generation) path: process ONE token, O(1) per step.
+
+        Args:
+            x_t: Pre-norm'd token embedding, ``(B, H)``.
+            h:   SSM hidden state from prior step, ``(B, H, N/2)`` complex.
+
+        Returns:
+            ``(out, h_new)``.
+        """
+        x32 = x_t.to(torch.float32)
+        y_raw, h_new = self.kernel.step(x32, h)
+        y_raw = y_raw + x32 * self.D  # skip connection
+        y_raw = y_raw.to(x_t.dtype)
+        # Gated readout (same gate as forward, but for a single token).
+        return self.out_proj(y_raw) * F.silu(self.gate_proj(x_t)), h_new
 
 
 # ==========================================================================
@@ -230,6 +294,30 @@ class DendriticResonatorBlock(nn.Module):
         x = x + self.dendrite(self.norm2(x))
         return x
 
+    def initial_state(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        """Zero-initialised per-block SSM hidden state."""
+        return self.ssm.initial_state(batch_size, device)
+
+    def step(
+        self, x_t: torch.Tensor, h: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recurrent single-token step through this block.
+
+        Args:
+            x_t: Token representation, ``(B, H)``.
+            h:   SSM hidden state, ``(B, H, N/2)`` complex.
+
+        Returns:
+            ``(x_out, h_new)``.
+        """
+        ssm_out, h_new = self.ssm.step(self.norm1(x_t), h)
+        x_t = x_t + ssm_out
+        # Dendrite is per-token — add a T=1 dim, apply, squeeze back.
+        x_t = x_t + self.dendrite(self.norm2(x_t).unsqueeze(1)).squeeze(1)
+        return x_t, h_new
+
 
 class VectorizedDendriticLM(nn.Module):
     """DSP-LM: dendritic branches over a diagonal-SSM temporal backbone.
@@ -295,6 +383,35 @@ class VectorizedDendriticLM(nn.Module):
                 x = block(x)
         return self.lm_head(self.norm_out(x))
 
+    # -- Recurrent (generation) interface --------------------------------
+
+    def initial_states(
+        self, batch_size: int, device: torch.device
+    ) -> list[torch.Tensor]:
+        """Zero-initialised hidden states for every block."""
+        return [block.initial_state(batch_size, device) for block in self.blocks]
+
+    def step(
+        self, token_ids: torch.Tensor, states: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Process a single token through all blocks using the recurrent SSM.
+
+        Args:
+            token_ids: ``(B,)`` — one token id per sequence in the batch.
+            states:    Per-block hidden states (from ``initial_states`` or a
+                       previous ``step`` call).
+
+        Returns:
+            ``(logits, new_states)`` where logits is ``(B, vocab_size)``.
+        """
+        x = self.embedding(token_ids)  # (B, H)
+        new_states: list[torch.Tensor] = []
+        for block, h in zip(self.blocks, states):
+            x, h_new = block.step(x, h)
+            new_states.append(h_new)
+        logits = self.lm_head(self.norm_out(x))  # (B, vocab)
+        return logits, new_states
+
     @torch.no_grad()
     def generate(
         self,
@@ -303,17 +420,36 @@ class VectorizedDendriticLM(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = 50,
     ) -> torch.Tensor:
+        """Autoregressive generation using the O(1)-per-step recurrent form.
+
+        The prompt is processed token-by-token through the recurrent SSM to
+        build up hidden state (compressed context), then each new token is
+        generated with a single ``step`` call — no FFT re-convolution over
+        the growing sequence.
+        """
         was_training = self.training
         self.eval()
+
+        batch_size = start_tokens.size(0)
+        device = start_tokens.device
+        states = self.initial_states(batch_size, device)
+
+        # Prefill: step through the prompt to build up hidden states.
+        for t in range(start_tokens.size(1)):
+            logits, states = self.step(start_tokens[:, t], states)
+
+        # Generate: each new token is O(1) — just one recurrent step.
         idx = start_tokens
         for _ in range(max_new_tokens):
-            logits = self(idx)[:, -1, :] / max(temperature, 1e-5)
+            scaled = logits / max(temperature, 1e-5)
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("inf")
-            probs = F.softmax(logits, dim=-1)
+                v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
+                scaled[scaled < v[:, [-1]]] = -float("inf")
+            probs = F.softmax(scaled, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, next_token), dim=1)
+            logits, states = self.step(next_token.squeeze(1), states)
+
         if was_training:
             self.train()
         return idx
