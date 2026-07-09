@@ -1266,7 +1266,9 @@ def main() -> None:
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1:
+    # Colab/Jupyter injects arguments like `-f /root/.../kernel.json`.
+    # Only intercept if the argument is exactly one of our CLI commands.
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ["pull", "push", "clean"]:
         cmd = sys.argv[1].lower()
         cfg = Config()
         if cmd == "pull":
@@ -1284,9 +1286,5 @@ if __name__ == "__main__":
                 print("Error: set hf_repo in Config first.")
                 sys.exit(1)
             hf_push_checkpoint(cfg.hf_repo, cfg.output_dir)
-        else:
-            print(f"Unknown command: {cmd}")
-            print("Usage: python colab_trainable_dendritic_lm.py [pull|push|clean]")
-            sys.exit(1)
     else:
         main()
