@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 from dataclasses import dataclass, field
 
 import torch
@@ -346,7 +347,12 @@ class Config:
     # Curriculum.
     steps_per_substep: int = 500
     log_every: int = 100
-    mask_prompt_loss: bool = True  # SFT: supervise only the Assistant response
+    # Chat template is always applied (teaches User/Assistant turn structure).
+    # Prompt-masking is OFF by default: for a from-scratch base model you want
+    # every token to teach, and long formal prompts otherwise leave whole packed
+    # blocks fully masked (wasted compute, risk of all-ignored batches). Turn it
+    # ON for a later dedicated SFT/instruction-polish phase.
+    mask_prompt_loss: bool = False
 
     output_dir: str = "./checkpoints/DSP_LM"
     resume: bool = True  # resume from latest checkpoint (skips finished substeps)
@@ -413,25 +419,18 @@ def make_formatters():
     return {"logic": logic, "math": prose, "physics": prose, "philosophy": philosophy}
 
 
-def encode_example(item, formatters, names, tokenizer, mask_prompt):
-    """Tokenise one row into (ids, loss_mask).
+def encode_example(name, item, formatters, tokenizer, mask_prompt):
+    """Tokenise one (dataset-name, row) into (ids, loss_mask).
 
     loss_mask[i] == 1 -> token i is supervised; 0 -> ignored (prompt tokens).
-    Provenance is lost after interleave_datasets, so try each phase formatter
-    and keep the richest match.
+    Provenance is known (the multiplexer tags each row with its dataset), so we
+    apply exactly that dataset's formatter — no schema guessing.
     """
-    best, best_len = None, -1
-    for name in names:
-        try:
-            r = formatters[name](item)
-        except Exception:
-            r = None
-        if r is not None and (len(r[1]) + len(r[2])) > best_len:
-            best, best_len = r, len(r[1]) + len(r[2])
-    if best is None:
+    r = formatters[name](item)
+    if r is None:
         return [], []
 
-    is_instruction, prompt, response = best
+    is_instruction, prompt, response = r
     eos = tokenizer.eos_token_id
     if is_instruction:
         pre = tokenizer.encode(CHAT_TEMPLATE.format(prompt=prompt))
@@ -444,6 +443,37 @@ def encode_example(item, formatters, names, tokenizer, mask_prompt):
     return ids, mask
 
 
+class WeightedMultiplex:
+    """Weighted round-robin over several raw streaming iterators.
+
+    Replaces datasets.interleave_datasets, which fails when sibling datasets
+    have differently-typed columns of the same name (e.g. reasoning-core's
+    `prompt` is Arrow large_string while Cosmopedia's is string). We sample in
+    plain Python, so no cross-dataset schema alignment is attempted, and each
+    yielded row keeps its dataset name for correct formatting.
+
+    Exhausted sources are dropped and weights renormalised (~ "all_exhausted").
+    """
+
+    def __init__(self, iterables, weights, names, seed=3407):
+        self.iters = [iter(it) for it in iterables]
+        self.weights = list(weights)
+        self.names = list(names)
+        self.rng = random.Random(seed)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while self.iters:
+            i = self.rng.choices(range(len(self.iters)), weights=self.weights)[0]
+            try:
+                return self.names[i], next(self.iters[i])
+            except StopIteration:
+                del self.iters[i], self.weights[i], self.names[i]
+        raise StopIteration
+
+
 class PackedTokenStream:
     """Packs tokenised examples into (seq_len+1) blocks with an aligned loss mask.
 
@@ -452,12 +482,9 @@ class PackedTokenStream:
     by EOS (added inside encode_example).
     """
 
-    def __init__(
-        self, ds_iter, formatters, names, tokenizer, seq_len, mask_prompt=True
-    ):
-        self.ds_iter = ds_iter
+    def __init__(self, multiplex, formatters, tokenizer, seq_len, mask_prompt=True):
+        self.mux = iter(multiplex)
         self.formatters = formatters
-        self.names = names
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.mask_prompt = mask_prompt
@@ -468,13 +495,13 @@ class PackedTokenStream:
         need = self.seq_len + 1
         while len(self.ids_buf) < need:
             try:
-                item = next(self.ds_iter)
+                name, item = next(self.mux)
             except StopIteration:
                 if len(self.ids_buf) < need:
                     return None, None
                 break
             ids, mask = encode_example(
-                item, self.formatters, self.names, self.tokenizer, self.mask_prompt
+                name, item, self.formatters, self.tokenizer, self.mask_prompt
             )
             if len(ids) > 5:
                 self.ids_buf.extend(ids)
@@ -623,7 +650,7 @@ def smoke_test(cfg: Config, device: str) -> None:
 
 
 def main() -> None:
-    from datasets import interleave_datasets, load_dataset
+    from datasets import load_dataset
     from transformers import AutoTokenizer
 
     cfg = Config()
@@ -729,22 +756,16 @@ def main() -> None:
                 f"{dict(zip(names, [round(w, 3) for w in weights], strict=False))}"
             )
 
-            merged = interleave_datasets(
-                [loaded[n] for n in names],
-                probabilities=weights,
-                seed=3407 + substep_idx,
-                stopping_strategy="all_exhausted",
-            )
+            # Weighted multiplex instead of interleave_datasets (which can't
+            # align differently-typed columns across these datasets).
             # NOTE: streaming iterators restart from the top on resume (their
             # position isn't checkpointed); with shuffled multi-GB pools this is
             # acceptable for a research run.
+            mux = WeightedMultiplex(
+                [loaded[n] for n in names], weights, names, seed=3407 + substep_idx
+            )
             stream = PackedTokenStream(
-                iter(merged),
-                formatters,
-                names,
-                tokenizer,
-                cfg.seq_len,
-                cfg.mask_prompt_loss,
+                mux, formatters, tokenizer, cfg.seq_len, cfg.mask_prompt_loss
             )
             streams = [stream]  # single packed stream; batch draws multiple blocks
 
@@ -755,6 +776,11 @@ def main() -> None:
                 if x is None:
                     print("  Stream exhausted early.")
                     break
+
+                # Guard: if prompt-masking left every target ignored, cross
+                # entropy would be NaN — skip this (degenerate) batch.
+                if (y != -100).sum() == 0:
+                    continue
 
                 if device == "cuda":
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
