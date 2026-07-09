@@ -457,18 +457,24 @@ class VectorizedDendriticLM(nn.Module):
 
 
 # Model-size presets. Each sets architecture (d_model/depth/branch_dim, keeping
-# d_ff = 4*d_model with num_branches=8) plus batch/grad_accum/lr tuned to fit an
-# A100 with gradient checkpointing. Token needs are ~20 tokens/param (Chinchilla).
+# d_ff = 4*d_model with num_branches=8) plus batch/grad_accum/lr. Effective batch
+# is held at ~96 across presets. Token needs are ~20 tokens/param (Chinchilla).
 #   42m  ~0.8B tokens  fastest, proof-of-concept
 #   110m ~2.2B tokens  strong capability-per-hour
 #   500m ~6-10B tokens RECOMMENDED max for a single A100 (DEFAULT)
 #   1b   ~20B tokens   fits an 80GB A100 but needs ~10+ A100-days — will be badly
 #                      undertrained on one GPU; included so you can experiment.
+#
+# batch_size is tuned for an **80GB** A100 with gradient checkpointing on; watch
+# the GPU-RAM gauge and push batch_size higher to fill ~60-70GB (raise grad_accum
+# to keep the same effective batch). On a 40GB A100 or a 12GB card, halve/quarter
+# batch_size. To trade the freed VRAM for ~30% more speed instead, you can also
+# set use_checkpoint=False (works at smaller batch; it OOMs with a big batch).
 MODEL_PRESETS = {
-    "42m":  {"d_model": 512,  "depth": 6,  "branch_dim": 256,  "batch_size": 24, "grad_accum": 4,  "lr": 3e-4},
-    "110m": {"d_model": 768,  "depth": 12, "branch_dim": 384,  "batch_size": 16, "grad_accum": 6,  "lr": 3e-4},
-    "500m": {"d_model": 1536, "depth": 18, "branch_dim": 768,  "batch_size": 12, "grad_accum": 8,  "lr": 2e-4},
-    "1b":   {"d_model": 2048, "depth": 22, "branch_dim": 1024, "batch_size": 6,  "grad_accum": 16, "lr": 1.5e-4},
+    "42m":  {"d_model": 512,  "depth": 6,  "branch_dim": 256,  "batch_size": 48, "grad_accum": 2, "lr": 3e-4},
+    "110m": {"d_model": 768,  "depth": 12, "branch_dim": 384,  "batch_size": 48, "grad_accum": 2, "lr": 3e-4},
+    "500m": {"d_model": 1536, "depth": 18, "branch_dim": 768,  "batch_size": 32, "grad_accum": 3, "lr": 2e-4},
+    "1b":   {"d_model": 2048, "depth": 22, "branch_dim": 1024, "batch_size": 16, "grad_accum": 6, "lr": 1.5e-4},
 }
 
 
