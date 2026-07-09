@@ -73,7 +73,9 @@ class ResonatorSSMKernel(nn.Module):
         half = n_states // 2
 
         # Per-channel timestep (discretisation step of the continuous system).
-        log_dt = torch.rand(d_model) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        log_dt = torch.rand(d_model) * (math.log(dt_max) - math.log(dt_min)) + math.log(
+            dt_min
+        )
         self.log_dt = nn.Parameter(log_dt)
 
         # Output/readout weights C (complex), stored as real view for autograd.
@@ -83,22 +85,24 @@ class ResonatorSSMKernel(nn.Module):
         # Pole parameterisation. log_A_real -> damping; A_imag -> frequency.
         # S4D-Lin init: real part 1/2, frequencies pi * n.
         self.log_A_real = nn.Parameter(torch.log(0.5 * torch.ones(d_model, half)))
-        self.A_imag = nn.Parameter(math.pi * torch.arange(half).repeat(d_model, 1).float())
+        self.A_imag = nn.Parameter(
+            math.pi * torch.arange(half).repeat(d_model, 1).float()
+        )
 
     def forward(self, length: int) -> torch.Tensor:
         """Return the real causal kernel of shape ``(d_model, length)``."""
         # Kernel math runs in float32 (complex ops are unsupported in bf16).
-        dt = torch.exp(self.log_dt)                          # (H,)
-        c = torch.view_as_complex(self.C)                    # (H, N/2)
-        a = -torch.exp(self.log_A_real) + 1j * self.A_imag   # (H, N/2) stable
+        dt = torch.exp(self.log_dt)  # (H,)
+        c = torch.view_as_complex(self.C)  # (H, N/2)
+        a = -torch.exp(self.log_A_real) + 1j * self.A_imag  # (H, N/2) stable
 
         # Discretise: dtA = dt * A, folding (e^{dtA}-1)/A into C (B ~ ones).
-        dt_a = a * dt.unsqueeze(-1)                           # (H, N/2)
-        c = c * (torch.exp(dt_a) - 1.0) / a                  # (H, N/2)
+        dt_a = a * dt.unsqueeze(-1)  # (H, N/2)
+        c = c * (torch.exp(dt_a) - 1.0) / a  # (H, N/2)
 
         # Vandermonde: powers of the discrete pole along the sequence axis.
         arange = torch.arange(length, device=a.device)
-        powers = torch.exp(dt_a.unsqueeze(-1) * arange)      # (H, N/2, L)
+        powers = torch.exp(dt_a.unsqueeze(-1) * arange)  # (H, N/2, L)
         kernel = 2.0 * torch.einsum("hn,hnl->hl", c, powers).real  # (H, L)
         return kernel
 
@@ -121,14 +125,14 @@ class ResonatorSSM(nn.Module):
         u = x.transpose(1, 2)  # (B, H, T)
 
         # Kernel + FFT convolution in float32 for numerical stability.
-        kernel = self.kernel(length).to(torch.float32)     # (H, T)
+        kernel = self.kernel(length).to(torch.float32)  # (H, T)
         u32 = u.to(torch.float32)
         n_fft = 2 * length
-        k_f = torch.fft.rfft(kernel, n=n_fft)              # (H, T_f)
-        u_f = torch.fft.rfft(u32, n=n_fft)                 # (B, H, T_f)
+        k_f = torch.fft.rfft(kernel, n=n_fft)  # (H, T_f)
+        u_f = torch.fft.rfft(u32, n=n_fft)  # (B, H, T_f)
         y = torch.fft.irfft(u_f * k_f, n=n_fft)[..., :length]  # (B, H, T)
         y = y + u32 * self.D.unsqueeze(-1)
-        y = y.transpose(1, 2).to(x.dtype)                  # (B, T, H)
+        y = y.transpose(1, 2).to(x.dtype)  # (B, T, H)
 
         # Gated readout.
         return self.out_proj(y) * F.silu(self.gate_proj(x))
@@ -174,22 +178,26 @@ class DendriticMLP(nn.Module):
         self.threshold = threshold
         self.gate_steepness = gate_steepness
 
-        self.value_proj = nn.Linear(d_model, self.d_ff)   # branch value vectors
+        self.value_proj = nn.Linear(d_model, self.d_ff)  # branch value vectors
         self.branch_gate = nn.Linear(d_model, num_branches)  # per-branch logic
-        self.out_proj = nn.Linear(self.d_ff, d_model)     # soma integration
+        self.out_proj = nn.Linear(self.d_ff, d_model)  # soma integration
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
 
         # Each branch computes a local nonlinear value vector.
-        value = F.silu(self.value_proj(x)).view(b, t, self.num_branches, self.branch_dim)
+        value = F.silu(self.value_proj(x)).view(
+            b, t, self.num_branches, self.branch_dim
+        )
 
         # Asymmetric soma gate: a branch fires only once structurally resolved.
-        logit = self.branch_gate(x)                       # (B, T, num_branches)
-        gate = torch.sigmoid(self.gate_steepness * (torch.sigmoid(logit) - self.threshold))
+        logit = self.branch_gate(x)  # (B, T, num_branches)
+        gate = torch.sigmoid(
+            self.gate_steepness * (torch.sigmoid(logit) - self.threshold)
+        )
 
         # Gate the full branch vectors (not a scalar), then integrate.
-        gated = value * gate.unsqueeze(-1)                # (B, T, num_branches, branch_dim)
+        gated = value * gate.unsqueeze(-1)  # (B, T, num_branches, branch_dim)
         return self.out_proj(gated.reshape(b, t, self.d_ff))
 
 
@@ -257,6 +265,26 @@ class VectorizedDendriticLM(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight  # weight tying
 
+        # Weight init (GPT-2 style). Without this, nn.Embedding defaults to
+        # N(0,1); tied to the output head that yields logits ~sqrt(d_model) in
+        # scale, so initial loss is ~10x above ln(vocab) and training stalls.
+        self.apply(self._init_weights)
+        # Scale residual output projections by 1/sqrt(2*depth) so the residual
+        # stream doesn't grow with depth (GPT-2 / nanoGPT trick).
+        residual_std = 0.02 / math.sqrt(2 * depth)
+        for pname, p in self.named_parameters():
+            if pname.endswith("out_proj.weight"):
+                nn.init.normal_(p, mean=0.0, std=residual_std)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embedding(x)
         for block in self.blocks:
@@ -300,27 +328,28 @@ class Config:
     # Model (A100-scale defaults).
     d_model: int = 512
     depth: int = 6
-    n_states: int = 64        # SSM states per channel (N/2 conjugate pole pairs)
-    num_branches: int = 8     # dendritic branches per token
-    branch_dim: int = 256     # width of each branch (d_ff = num_branches*branch_dim)
+    n_states: int = 64  # SSM states per channel (N/2 conjugate pole pairs)
+    num_branches: int = 8  # dendritic branches per token
+    branch_dim: int = 256  # width of each branch (d_ff = num_branches*branch_dim)
     use_checkpoint: bool = True
 
     # Data / optimisation.
-    seq_len: int = 2048          # SSM gives real long context (was 256)
+    seq_len: int = 2048  # SSM gives real long context (was 256)
     batch_size: int = 8
-    grad_accum: int = 8          # effective batch 64
+    grad_accum: int = 8  # effective batch 64
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
-    min_lr_ratio: float = 0.1    # cosine floor as a fraction of lr
+    min_lr_ratio: float = 0.1  # cosine floor as a fraction of lr
 
     # Curriculum.
     steps_per_substep: int = 500
     log_every: int = 100
+    mask_prompt_loss: bool = True  # SFT: supervise only the Assistant response
 
     output_dir: str = "./checkpoints/DSP_LM"
-    resume: bool = True          # resume from latest checkpoint if present
+    resume: bool = True  # resume from latest checkpoint (skips finished substeps)
 
     # Dataset slate: a balanced, non-gated, all-streamable "curriculum of
     # courses". Each entry is (repo, config_or_None). All four share the spirit
@@ -350,89 +379,118 @@ class Config:
 # ==========================================================================
 
 
-def make_extractors():
-    """Per-dataset text extractors. The datasets have very different schemas;
-    a generic 'first string field' guess trains on labels/titles, not content.
+CHAT_TEMPLATE = "User: {prompt}\nAssistant:"  # response follows after this
+
+
+def make_formatters():
+    """Structured per-dataset formatters -> (is_instruction, prompt, response).
+
+    QA/instruction datasets become User/Assistant turns; during training the
+    prompt tokens are masked out of the loss so the model is only supervised to
+    produce the response (standard SFT). Prose corpora (textbooks) are plain
+    continuation with full supervision. Returns None when the schema doesn't
+    match (used to detect provenance after interleave loses it).
     """
 
-    def logic(item: dict) -> str:  # reasoning-core: prompt / cot / answer
-        parts = [item.get("prompt", ""), item.get("cot", ""), item.get("answer", "")]
-        return "\n".join(p for p in parts if isinstance(p, str) and p)
+    def logic(item):  # reasoning-core: prompt -> (chain-of-thought + answer)
+        p = item.get("prompt", "")
+        if not (isinstance(p, str) and p):
+            return None
+        c, a = item.get("cot", ""), item.get("answer", "")
+        response = "\n".join(s for s in (c, a) if isinstance(s, str) and s)
+        return (True, p, response) if response else None
 
-    def course_text(item: dict) -> str:  # cosmopedia (khanacademy/openstax): 'text'
-        t = item.get("text", "")
-        return t if isinstance(t, str) else ""
-
-    def philosophy(item: dict) -> str:  # strix: question / answer (csv columns)
+    def philosophy(item):  # strix: question -> answer
         q, a = item.get("question", ""), item.get("answer", "")
-        if q or a:
-            return "\n".join(p for p in (q, a) if isinstance(p, str) and p)
-        for key in ("text", "content", "output"):
-            if isinstance(item.get(key), str):
-                return item[key]
-        return ""
+        if isinstance(q, str) and q and isinstance(a, str) and a:
+            return (True, q, a)
+        return None
 
-    # math and physics both come from Cosmopedia's uniform 'text' schema.
-    return {
-        "logic": logic,
-        "math": course_text,
-        "physics": course_text,
-        "philosophy": philosophy,
-    }
+    def prose(item):  # cosmopedia textbooks: plain continuation, no prompt
+        t = item.get("text", "")
+        return (False, "", t) if isinstance(t, str) and t else None
+
+    return {"logic": logic, "math": prose, "physics": prose, "philosophy": philosophy}
+
+
+def encode_example(item, formatters, names, tokenizer, mask_prompt):
+    """Tokenise one row into (ids, loss_mask).
+
+    loss_mask[i] == 1 -> token i is supervised; 0 -> ignored (prompt tokens).
+    Provenance is lost after interleave_datasets, so try each phase formatter
+    and keep the richest match.
+    """
+    best, best_len = None, -1
+    for name in names:
+        try:
+            r = formatters[name](item)
+        except Exception:
+            r = None
+        if r is not None and (len(r[1]) + len(r[2])) > best_len:
+            best, best_len = r, len(r[1]) + len(r[2])
+    if best is None:
+        return [], []
+
+    is_instruction, prompt, response = best
+    eos = tokenizer.eos_token_id
+    if is_instruction:
+        pre = tokenizer.encode(CHAT_TEMPLATE.format(prompt=prompt))
+        ans = tokenizer.encode(f" {response}") + [eos]
+        ids = pre + ans
+        mask = ([0] * len(pre) + [1] * len(ans)) if mask_prompt else [1] * len(ids)
+    else:
+        ids = tokenizer.encode(response) + [eos]
+        mask = [1] * len(ids)
+    return ids, mask
 
 
 class PackedTokenStream:
-    """Packs tokenized documents into contiguous (seq_len+1) blocks.
+    """Packs tokenised examples into (seq_len+1) blocks with an aligned loss mask.
 
-    Far more efficient than padding every document to max_length: no padding
-    waste, every position contributes a real next-token loss, and long-context
-    windows are actually filled. Documents are separated by the EOS token.
+    No padding waste; every block is full. Prompt tokens carry mask 0 (ignored
+    by the loss), response / prose tokens carry mask 1. Examples are separated
+    by EOS (added inside encode_example).
     """
 
-    def __init__(self, ds_iter, extractors, phase_datasets, tokenizer, seq_len):
+    def __init__(
+        self, ds_iter, formatters, names, tokenizer, seq_len, mask_prompt=True
+    ):
         self.ds_iter = ds_iter
-        self.extractors = extractors
-        self.phase_datasets = phase_datasets
+        self.formatters = formatters
+        self.names = names
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.eos = tokenizer.eos_token_id
-        self.buffer: list[int] = []
-
-    def _next_text(self):
-        # interleave_datasets loses which sub-dataset a row came from, so we
-        # detect schema by trying each phase extractor and taking the longest.
-        item = next(self.ds_iter)
-        best = ""
-        for name in self.phase_datasets:
-            try:
-                t = self.extractors[name](item)
-            except Exception:
-                t = ""
-            if len(t) > len(best):
-                best = t
-        return best
+        self.mask_prompt = mask_prompt
+        self.ids_buf: list[int] = []
+        self.mask_buf: list[int] = []
 
     def get_block(self, device):
-        """Return one (1, seq_len) x / y pair of packed tokens."""
         need = self.seq_len + 1
-        while len(self.buffer) < need:
+        while len(self.ids_buf) < need:
             try:
-                text = self._next_text()
+                item = next(self.ds_iter)
             except StopIteration:
-                if len(self.buffer) < need:
+                if len(self.ids_buf) < need:
                     return None, None
                 break
-            if text and len(text.strip()) > 20:
-                self.buffer.extend(self.tokenizer.encode(text))
-                self.buffer.append(self.eos)
-        block = self.buffer[:need]
-        self.buffer = self.buffer[need:]
-        ids = torch.tensor(block, dtype=torch.long, device=device)
-        return ids[:-1].unsqueeze(0), ids[1:].unsqueeze(0)
+            ids, mask = encode_example(
+                item, self.formatters, self.names, self.tokenizer, self.mask_prompt
+            )
+            if len(ids) > 5:
+                self.ids_buf.extend(ids)
+                self.mask_buf.extend(mask)
+        ids = torch.tensor(self.ids_buf[:need], dtype=torch.long, device=device)
+        mask = torch.tensor(self.mask_buf[:need], dtype=torch.long, device=device)
+        self.ids_buf = self.ids_buf[need:]
+        self.mask_buf = self.mask_buf[need:]
+        x = ids[:-1].unsqueeze(0)
+        y = ids[1:].clone()
+        y[mask[1:] == 0] = -100  # ignore prompt targets (cross_entropy default)
+        return x, y.unsqueeze(0)
 
 
 def get_packed_batch(streams, batch_size, device):
-    """Assemble a batch by drawing one block from a round-robin of streams."""
+    """Assemble a batch by drawing packed blocks from the stream(s)."""
     xs, ys = [], []
     for _ in range(batch_size):
         stream = streams[len(xs) % len(streams)]
@@ -451,13 +509,14 @@ def get_packed_batch(streams, batch_size, device):
 # ==========================================================================
 
 
-def save_checkpoint(path, model, optimizer, scheduler, step, cfg):
+def save_checkpoint(path, model, optimizer, scheduler, step, completed_substeps, cfg):
     torch.save(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "step": step,
+            "completed_substeps": completed_substeps,
             "config": cfg.__dict__,
         },
         path,
@@ -469,7 +528,7 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
-    return ckpt.get("step", 0)
+    return ckpt.get("step", 0), ckpt.get("completed_substeps", 0)
 
 
 # ==========================================================================
@@ -505,32 +564,62 @@ def make_scheduler(cfg: Config, optimizer, total_steps: int):
 
 
 def smoke_test(cfg: Config, device: str) -> None:
-    """Validate the whole train step on synthetic data — no downloads."""
-    print("=== SMOKE TEST (synthetic data, tiny model) ===")
-    cfg.d_model, cfg.depth, cfg.seq_len = 64, 2, 128
-    cfg.batch_size, cfg.grad_accum, cfg.n_states = 2, 2, 16
+    """Validate the whole train step on a LEARNABLE synthetic task.
+
+    The task is next = (token + 1) mod vocab: a deterministic pattern the model
+    must actually learn, so a healthy run shows loss falling well below the
+    random-guess baseline ln(vocab). (If x and y are independent random noise,
+    loss can never drop below ln(vocab) — that tests plumbing, not learning.)
+    """
+    import math as _math
+
+    print("=== SMOKE TEST (learnable synthetic task, tiny model) ===")
+    cfg.d_model, cfg.depth, cfg.seq_len = 64, 2, 64
+    cfg.batch_size, cfg.grad_accum, cfg.n_states = 8, 1, 16
     cfg.num_branches, cfg.branch_dim = 4, 32
-    vocab_size = 512
+    cfg.warmup_steps, cfg.lr = 5, 3e-3
+    vocab_size = 256
+    n_steps = 60
+    baseline = _math.log(vocab_size)
+
     model, optimizer = build_model_and_optim(cfg, vocab_size, device)
-    scheduler = make_scheduler(cfg, optimizer, total_steps=10)
+    scheduler = make_scheduler(cfg, optimizer, total_steps=n_steps)
     print(f"params: {sum(p.numel() for p in model.parameters())/1e3:.1f}K")
-    for step in range(6):
+    print(
+        f"random-guess loss (ln vocab) = {baseline:.3f}; a healthy run drops below it"
+    )
+
+    first_loss = None
+    last_loss = None
+    for step in range(n_steps):
         x = torch.randint(0, vocab_size, (cfg.batch_size, cfg.seq_len), device=device)
-        y = torch.randint(0, vocab_size, (cfg.batch_size, cfg.seq_len), device=device)
+        y = (x + 1) % vocab_size
         model.train()
         logits = model(x)
         loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-        (loss / cfg.grad_accum).backward()
-        if (step + 1) % cfg.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
         assert torch.isfinite(loss), "NaN/Inf loss"
-        print(f"  step {step} loss {loss.item():.4f}")
+        first_loss = first_loss or loss.item()
+        last_loss = loss.item()
+        if step % 10 == 0 or step == n_steps - 1:
+            print(
+                f"  step {step:02d} | loss {loss.item():.4f} | ppl {_math.exp(min(20, loss.item())):.1f}"
+            )
+
     gen = model.generate(x[:, :4], max_new_tokens=8, top_k=10)
     assert gen.shape == (cfg.batch_size, 12)
-    print(f"generate OK -> {tuple(gen.shape)}\n=== SMOKE TEST PASSED ===")
+    print(f"\ninitial loss {first_loss:.3f} -> final loss {last_loss:.3f}")
+    assert (
+        first_loss < baseline * 2
+    ), f"initial loss {first_loss:.1f} >> ln(vocab) {baseline:.1f} — logits mis-scaled (init bug)"
+    assert last_loss < first_loss * 0.8, "loss did not fall — model is not learning"
+    print(
+        f"generate OK -> {tuple(gen.shape)}\n=== SMOKE TEST PASSED (model learns) ==="
+    )
 
 
 def main() -> None:
@@ -555,7 +644,7 @@ def main() -> None:
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     # Robust dataset loading: drop anything that fails (e.g. gated physics).
-    extractors = make_extractors()
+    formatters = make_formatters()
     loaded = {}
     for name, (repo, cfg_name) in cfg.repos.items():
         try:
@@ -566,16 +655,30 @@ def main() -> None:
             print(f"  SKIP  {name:<10} <- {repo}  ({type(exc).__name__}: {exc})")
 
     phases = [
-        {"name": "Phase_1_Logic_Dominant", "desc": "Foundational Logic (90/10)",
-         "datasets": ["logic", "math"], "mixtures": [[0.90, 0.10]]},
-        {"name": "Phase_2_Math_Introduction", "desc": "Interpolating Logic and Math",
-         "datasets": ["logic", "math"], "mixtures": [[0.30, 0.70], [0.50, 0.50]]},
-        {"name": "Phase_3_Physics_Application", "desc": "Physics & Derivations",
-         "datasets": ["logic", "math", "physics"],
-         "mixtures": [[0.10, 0.20, 0.70], [0.15, 0.25, 0.60], [0.20, 0.30, 0.50]]},
-        {"name": "Phase_4_Philosophy_Meta", "desc": "Philosophy & Conceptual Analysis",
-         "datasets": ["logic", "math", "physics", "philosophy"],
-         "mixtures": [[0.25, 0.25, 0.25, 0.25]]},
+        {
+            "name": "Phase_1_Logic_Dominant",
+            "desc": "Foundational Logic (90/10)",
+            "datasets": ["logic", "math"],
+            "mixtures": [[0.90, 0.10]],
+        },
+        {
+            "name": "Phase_2_Math_Introduction",
+            "desc": "Interpolating Logic and Math",
+            "datasets": ["logic", "math"],
+            "mixtures": [[0.30, 0.70], [0.50, 0.50]],
+        },
+        {
+            "name": "Phase_3_Physics_Application",
+            "desc": "Physics & Derivations",
+            "datasets": ["logic", "math", "physics"],
+            "mixtures": [[0.10, 0.20, 0.70], [0.15, 0.25, 0.60], [0.20, 0.30, 0.50]],
+        },
+        {
+            "name": "Phase_4_Philosophy_Meta",
+            "desc": "Philosophy & Conceptual Analysis",
+            "datasets": ["logic", "math", "physics", "philosophy"],
+            "mixtures": [[0.25, 0.25, 0.25, 0.25]],
+        },
     ]
 
     total_substeps = sum(len(p["mixtures"]) for p in phases)
@@ -585,26 +688,46 @@ def main() -> None:
     os.makedirs(cfg.output_dir, exist_ok=True)
     latest = os.path.join(cfg.output_dir, "latest.pt")
     global_step = 0
+    completed_substeps = 0
     if cfg.resume and os.path.exists(latest):
-        global_step = load_checkpoint(latest, model, optimizer, scheduler, device)
-        print(f"Resumed from {latest} at optimizer step {global_step}")
+        global_step, completed_substeps = load_checkpoint(
+            latest, model, optimizer, scheduler, device
+        )
+        print(
+            f"Resumed from {latest}: step {global_step}, {completed_substeps} substeps done"
+        )
 
     print("\nStarting curriculum training...")
+    substep_global = 0  # flat index across all phases, for resume skip-ahead
     for phase in phases:
         # Keep only datasets that actually loaded; renormalise the mixture.
         avail = [d for d in phase["datasets"] if d in loaded]
         if not avail:
             print(f"Skipping {phase['name']} — no datasets available.")
             continue
-        print(f"\n{'=' * 60}\n{phase['name']}\n{phase['desc']}\n{'=' * 60}")
+        header_shown = False
 
         for substep_idx, probs in enumerate(phase["mixtures"]):
-            kept = [(d, p) for d, p in zip(phase["datasets"], probs) if d in loaded]
+            # Skip substeps already finished in a previous run.
+            if substep_global < completed_substeps:
+                substep_global += 1
+                continue
+            if not header_shown:
+                print(f"\n{'=' * 60}\n{phase['name']}\n{phase['desc']}\n{'=' * 60}")
+                header_shown = True
+
+            kept = [
+                (d, p)
+                for d, p in zip(phase["datasets"], probs, strict=False)
+                if d in loaded
+            ]
             names = [d for d, _ in kept]
             weights = [p for _, p in kept]
             weights = [w / sum(weights) for w in weights]  # renormalise
-            print(f"\n  Substep {substep_idx + 1}/{len(phase['mixtures'])} - "
-                  f"{dict(zip(names, [round(w, 3) for w in weights]))}")
+            print(
+                f"\n  Substep {substep_idx + 1}/{len(phase['mixtures'])} - "
+                f"{dict(zip(names, [round(w, 3) for w in weights], strict=False))}"
+            )
 
             merged = interleave_datasets(
                 [loaded[n] for n in names],
@@ -612,7 +735,17 @@ def main() -> None:
                 seed=3407 + substep_idx,
                 stopping_strategy="all_exhausted",
             )
-            stream = PackedTokenStream(iter(merged), extractors, names, tokenizer, cfg.seq_len)
+            # NOTE: streaming iterators restart from the top on resume (their
+            # position isn't checkpointed); with shuffled multi-GB pools this is
+            # acceptable for a research run.
+            stream = PackedTokenStream(
+                iter(merged),
+                formatters,
+                names,
+                tokenizer,
+                cfg.seq_len,
+                cfg.mask_prompt_loss,
+            )
             streams = [stream]  # single packed stream; batch draws multiple blocks
 
             optimizer.zero_grad(set_to_none=True)
@@ -634,7 +767,9 @@ def main() -> None:
                 (loss / cfg.grad_accum).backward()
 
                 if (step + 1) % cfg.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), cfg.max_grad_norm
+                    )
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -642,20 +777,34 @@ def main() -> None:
 
                 if step % cfg.log_every == 0 or step == cfg.steps_per_substep - 1:
                     ppl = math.exp(min(20, loss.item()))
-                    print(f"  [{phase['name']} | sub {substep_idx + 1}] step {step:04d} "
-                          f"| loss {loss.item():.4f} | ppl {ppl:8.1f} "
-                          f"| lr {scheduler.get_last_lr()[0]:.2e}")
+                    print(
+                        f"  [{phase['name']} | sub {substep_idx + 1}] step {step:04d} "
+                        f"| loss {loss.item():.4f} | ppl {ppl:8.1f} "
+                        f"| lr {scheduler.get_last_lr()[0]:.2e}"
+                    )
 
             # Flush trailing accumulated gradients, then checkpoint.
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            substep_global += 1  # this substep is now complete
 
-            out_dir = os.path.join(cfg.output_dir, phase["name"], f"substep_{substep_idx + 1}")
+            out_dir = os.path.join(
+                cfg.output_dir, phase["name"], f"substep_{substep_idx + 1}"
+            )
             os.makedirs(out_dir, exist_ok=True)
-            save_checkpoint(os.path.join(out_dir, "checkpoint.pt"),
-                            model, optimizer, scheduler, global_step, cfg)
-            save_checkpoint(latest, model, optimizer, scheduler, global_step, cfg)
+            save_checkpoint(
+                os.path.join(out_dir, "checkpoint.pt"),
+                model,
+                optimizer,
+                scheduler,
+                global_step,
+                substep_global,
+                cfg,
+            )
+            save_checkpoint(
+                latest, model, optimizer, scheduler, global_step, substep_global, cfg
+            )
             tokenizer.save_pretrained(out_dir)
             print(f"  Saved checkpoint -> {out_dir}")
 

@@ -16,7 +16,7 @@ Dendritic Branching Logic: Instead of a single weighted sum, each artificial neu
 
 Causal Resonant Field Mixing (Diagonal SSM): Token sequences are treated as a driven 1D latent field using damped resonators — a diagonal, complex-pole State-Space Model (S4D-style). Each channel is a stable damped oscillator (pole = -exp(a) + i·ω: negative real part damps, imaginary part sets the resonant frequency). The response is applied as a causal FFT convolution, giving an effectively unbounded receptive field at O(N log N) cost with none of the quadratic memory blowup of self-attention. This replaces the earlier dilated-convolution prototype, whose fixed kernel could only see ~100 tokens regardless of input length — which is why long sequence lengths now train correctly.
 
-Asymmetric Error Cost Gating (The Soma): Each branch produces a value *vector*; a steep, differentiable sigmoid gate decides whether that branch has structurally resolved and, if not, suppresses its whole vector toward zero (Type II Error avoidance — dropping unresolved/hallucinated states). The soma then integrates the surviving branch vectors back to the model dimension. (Earlier prototypes collapsed each branch to a single scalar before integrating, wasting almost all of the branch capacity; the gate now acts on the full vector.)
+Asymmetric Error Cost Gating (The Soma): Each branch produces a value _vector_; a steep, differentiable sigmoid gate decides whether that branch has structurally resolved and, if not, suppresses its whole vector toward zero (Type II Error avoidance — dropping unresolved/hallucinated states). The soma then integrates the surviving branch vectors back to the model dimension. (Earlier prototypes collapsed each branch to a single scalar before integrating, wasting almost all of the branch capacity; the gate now acts on the full vector.)
 
 Vectorized Topology: To achieve extreme parameter density without the latency of Python loops, the entire physical geometry of the branches is collapsed into multi-dimensional tensors processed simultaneously via Einstein Summation (torch.einsum).
 
@@ -26,12 +26,12 @@ Instead of training on a randomized, entangled corpus, the DSP-LM script utilize
 
 Dataset slate (all non-gated, all stream cleanly, balanced "curriculum of courses"):
 
-| Phase | Dataset | Size | Style |
-|---|---|---|---|
-| Logic | `reasoning-core/procedural-pretraining-pile` | ~7.3 GB | Procedural formal reasoning, correct-by-design (PDDL, FOL, CFG, causal). Its generator scales to trillions of tokens; the hosted file is 7 GB. |
-| Math | `HuggingFaceTB/cosmopedia` · `khanacademy` | ~108 MB | Khan Academy course prose (synthetic, Mixtral-generated). |
-| Physics | `HuggingFaceTB/cosmopedia` · `openstax` | ~668 MB | OpenStax textbook prose, including University Physics. |
-| Philosophy | `sayhan/strix-philosophy-qa` | ~391 MB | 134K philosophy Q&A pairs derived from the SEP. |
+| Phase      | Dataset                                      | Size    | Style                                                                                                                                          |
+| ---------- | -------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Logic      | `reasoning-core/procedural-pretraining-pile` | ~7.3 GB | Procedural formal reasoning, correct-by-design (PDDL, FOL, CFG, causal). Its generator scales to trillions of tokens; the hosted file is 7 GB. |
+| Math       | `HuggingFaceTB/cosmopedia` · `khanacademy`   | ~108 MB | Khan Academy course prose (synthetic, Mixtral-generated).                                                                                      |
+| Physics    | `HuggingFaceTB/cosmopedia` · `openstax`      | ~668 MB | OpenStax textbook prose, including University Physics.                                                                                         |
+| Philosophy | `sayhan/strix-philosophy-qa`                 | ~391 MB | 134K philosophy Q&A pairs derived from the SEP.                                                                                                |
 
 Because the pipeline **streams** and packs, total pool size barely matters — you only ever pull what `steps × batch × seq_len` demands (tens of MB per substep), so there is no multi-GB download. The earlier slate mixed a 56 GB math corpus with a 30 MB gated physics set; the small one would have been cycled and memorised while the gated one failed to load at all. Scale-up swaps (still non-gated) are noted in the `Config.repos` comments: math → `cosmopedia:auto_math_text` (~8.8 GB), humanities → `cosmopedia:stanford` (~6.3 GB).
 
@@ -63,19 +63,21 @@ Goal: Routes highly abstract, semantic noise through the previously established 
 
 The entire architecture and curriculum are condensed into a single script (`colab_trainable_dendritic_lm.py`). It is designed to be executed in a high-VRAM environment (an A100 on Colab Pro) utilizing PyTorch bfloat16 Automatic Mixed Precision plus gradient checkpointing so long (2048-token) sequences fit in memory. Convert it to a notebook with `jupytext --to notebook colab_trainable_dendritic_lm.py`.
 
+```
+jupytext --to notebook --output Colab_Trainable_Dendritic_LM.ipynb colab_trainable_dendritic_lm.py
+```
+
 1. Install Requirements
 
 In your first Colab cell, install the necessary HuggingFace libraries:
 
 pip install torch transformers datasets accelerate
 
-
 2. Run the Training Loop
 
 Run the script directly. It will automatically initialize the GPT-2 Tokenizer, mount the streaming datasets, and begin the multi-phase curriculum.
 
 python colab_trainable_dendritic_lm.py
-
 
 3. Checkpoints & Outputs
 
