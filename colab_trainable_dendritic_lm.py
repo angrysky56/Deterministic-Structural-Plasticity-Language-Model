@@ -456,24 +456,40 @@ class VectorizedDendriticLM(nn.Module):
 # ==========================================================================
 
 
+# Model-size presets. Each sets architecture (d_model/depth/branch_dim, keeping
+# d_ff = 4*d_model with num_branches=8) plus batch/grad_accum/lr tuned to fit an
+# A100 with gradient checkpointing. Token needs are ~20 tokens/param (Chinchilla).
+#   42m  ~0.8B tokens  fastest, proof-of-concept
+#   110m ~2.2B tokens  strong capability-per-hour
+#   500m ~6-10B tokens RECOMMENDED max for a single A100 (DEFAULT)
+#   1b   ~20B tokens   fits an 80GB A100 but needs ~10+ A100-days — will be badly
+#                      undertrained on one GPU; included so you can experiment.
+MODEL_PRESETS = {
+    "42m":  {"d_model": 512,  "depth": 6,  "branch_dim": 256,  "batch_size": 24, "grad_accum": 4,  "lr": 3e-4},
+    "110m": {"d_model": 768,  "depth": 12, "branch_dim": 384,  "batch_size": 16, "grad_accum": 6,  "lr": 3e-4},
+    "500m": {"d_model": 1536, "depth": 18, "branch_dim": 768,  "batch_size": 12, "grad_accum": 8,  "lr": 2e-4},
+    "1b":   {"d_model": 2048, "depth": 22, "branch_dim": 1024, "batch_size": 6,  "grad_accum": 16, "lr": 1.5e-4},
+}
+
+
 @dataclass
 class Config:
-    # Model (A100-scale defaults).
-    d_model: int = 512
-    depth: int = 6
+    # Pick model scale here; override any field below to customise.
+    preset: str = "500m"
+
+    # Architecture — left None to inherit from the preset.
+    d_model: int | None = None
+    depth: int | None = None
+    branch_dim: int | None = None  # width of each branch (d_ff = num_branches*branch_dim)
     n_states: int = 64  # SSM states per channel (N/2 conjugate pole pairs)
     num_branches: int = 8  # dendritic branches per token
-    branch_dim: int = 256  # width of each branch (d_ff = num_branches*branch_dim)
     use_checkpoint: bool = True
 
-    # Data / optimisation.
+    # Data / optimisation (batch_size/grad_accum/lr inherit from the preset if None).
     seq_len: int = 2048  # SSM gives real long context (was 256)
-    # A100 has plenty of room. The memory ceiling is the logits tensor
-    # (batch*seq*vocab); 24 fits a 40GB A100 with checkpointing on. Lower to
-    # 4-8 on a 12GB card. grad_accum trades update frequency for effective batch.
-    batch_size: int = 24
-    grad_accum: int = 4  # effective batch 96
-    lr: float = 3e-4
+    batch_size: int | None = None
+    grad_accum: int | None = None
+    lr: float | None = None
     weight_decay: float = 0.01
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
@@ -513,25 +529,36 @@ class Config:
     # courses". Each entry is (repo, config_or_None). All four share the spirit
     # of the curriculum — formal reasoning, then course/textbook material.
     #
-    #   logic      reasoning-core/procedural-pretraining-pile  ~7.3GB  formal, correct-by-design
-    #   math       microsoft/orca-math-word-problems-200k      ~225MB  200k math word-problem Q&A
-    #   physics    cosmopedia/openstax                         ~668MB  OpenStax textbooks (incl. Univ. Physics)
-    #   philosophy sayhan/strix-philosophy-qa                  ~391MB  134k philosophy Q&A
-    #   qa         yahma/alpaca-cleaned                        ~40MB   51k general instruction Q&A
+    #   logic      reasoning-core/procedural-pretraining-pile  ~7.3GB / 3.1M rows  formal, correct-by-design
+    #   math       open-web-math/open-web-math                 14.7B tokens        never runs out
+    #   physics    millawell/wikipedia_field_of_science        ~9.6GB science wiki  broad science, never runs out
+    #   philosophy sayhan/strix-philosophy-qa                  ~391MB / 134k       philosophy Q&A (final phase)
+    #   qa         yahma/alpaca-cleaned                        ~40MB / 51k         general instruction Q&A (final phase)
     #
-    # Streaming means pool size barely matters — you only pull what
-    # steps*batch*seq_len demands. Scale-up swaps (bigger, still non-gated):
-    # math -> ("HuggingFaceTB/cosmopedia", "auto_math_text") ~8.8GB;
-    # humanities -> ("HuggingFaceTB/cosmopedia", "stanford") ~6.3GB.
+    # Streaming means only the consumed slice is read; the big pools above are
+    # large enough that math/physics never cycle at these step counts. The small
+    # Q&A sets sit in the final phase at low weight (some cycling is fine there).
+    # Scale-up / swap options (all non-gated):
+    #   logic   -> ("reasoning-core/basic-procedural", None)      7.6M rows
+    #   physics -> ("HuggingFaceTB/cosmopedia", "openstax")       real physics textbooks, but only ~668MB (cycles)
+    #   math QA -> ("microsoft/orca-math-word-problems-200k")     reintroduce as SFT later
     repos: dict = field(
         default_factory=lambda: {
             "logic": ("reasoning-core/procedural-pretraining-pile", None),
-            "math": ("microsoft/orca-math-word-problems-200k", None),
-            "physics": ("HuggingFaceTB/cosmopedia", "openstax"),
+            "math": ("open-web-math/open-web-math", None),
+            "physics": ("millawell/wikipedia_field_of_science", None),
             "philosophy": ("sayhan/strix-philosophy-qa", None),
             "qa": ("yahma/alpaca-cleaned", None),
         }
     )
+
+    def __post_init__(self):
+        # Fill any architecture / batch field left as None from the chosen preset.
+        if self.preset not in MODEL_PRESETS:
+            raise ValueError(f"unknown preset {self.preset!r}; choose {list(MODEL_PRESETS)}")
+        for key, value in MODEL_PRESETS[self.preset].items():
+            if getattr(self, key) is None:
+                setattr(self, key, value)
 
 
 # ==========================================================================
@@ -577,13 +604,21 @@ def make_formatters():
         prompt = f"{instr}\n{inp}" if isinstance(inp, str) and inp else instr
         return (True, prompt, out)
 
-    def prose(item):  # cosmopedia textbooks: plain continuation, no prompt
+    def prose(item):  # open-web-math / science-wiki: plain continuation ('text')
         t = item.get("text", "")
-        return (False, "", t) if isinstance(t, str) and t else None
+        if isinstance(t, str) and t:
+            return (False, "", t)
+        # robustness: fall back to any other long string field
+        for v in item.values():
+            if isinstance(v, str) and len(v) > 200:
+                return (False, "", v)
+        return None
 
+    # math & physics are now large prose corpora; qa_pair/alpaca stay for the
+    # Q&A domains. (orca-math's qa_pair formatter is kept for a future SFT pass.)
     return {
         "logic": logic,
-        "math": qa_pair,
+        "math": prose,
         "physics": prose,
         "philosophy": qa_pair,
         "qa": alpaca,
@@ -997,13 +1032,16 @@ def hf_clean(hf_repo: str, output_dir: str) -> None:
             print("  No remote repo to delete.")
 
 
-def main() -> None:
+def main(resume_override: bool | None = None) -> None:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
     cfg = Config()
+    if resume_override is not None:
+        cfg.resume = resume_override  # CLI 'resume' / 'overwrite' switch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    print(f"Mode: {'RESUME from latest checkpoint' if cfg.resume else 'OVERWRITE (fresh start)'}")
 
     if os.environ.get("DSP_SMOKE") == "1":
         smoke_test(cfg, device)
@@ -1265,8 +1303,8 @@ if __name__ == "__main__":
 
     # Colab/Jupyter injects arguments like `-f /root/.../kernel.json`.
     # Only intercept if the argument is exactly one of our CLI commands.
-    if len(sys.argv) > 1 and sys.argv[1].lower() in ["pull", "push", "clean"]:
-        cmd = sys.argv[1].lower()
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    if cmd in ["pull", "push", "clean"]:
         cfg = Config()
         if cmd == "pull":
             # Download checkpoints from HF Hub into the local project.
@@ -1283,5 +1321,12 @@ if __name__ == "__main__":
                 print("Error: set hf_repo in Config first.")
                 sys.exit(1)
             hf_push_checkpoint(cfg.hf_repo, cfg.output_dir)
+    elif cmd in ["overwrite", "fresh", "restart"]:
+        # Start a fresh run, ignoring any existing checkpoint. (Existing
+        # checkpoints are left on disk and overwritten as training saves; use
+        # the `clean` command to wipe them entirely first.)
+        main(resume_override=False)
+    elif cmd == "resume":
+        main(resume_override=True)  # force-resume from latest checkpoint
     else:
-        main()
+        main()  # default: uses cfg.resume (resume if a checkpoint exists)
