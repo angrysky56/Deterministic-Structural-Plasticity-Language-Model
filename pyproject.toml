@@ -1,0 +1,13 @@
+[project]
+name = "deterministic-structural-plasticity-language-model"
+version = "0.1.0"
+description = "DSP-LM: Deterministic Structural Plasticity Language Model"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "datasets>=2.19",
+    "accelerate>=0.30",
+    "jupytext>=1.16",
+]

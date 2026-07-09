@@ -1,0 +1,12 @@
+# DSP-LM dependencies.
+# Colab already ships a CUDA build of torch; pin only the ecosystem libs.
+# Local install (Pop!_OS, RTX 3060/A100): prefer `uv pip install -r requirements.txt`.
+
+torch>=2.2            # bfloat16 autocast, non-reentrant checkpoint, torch.fft
+transformers>=4.40    # GPT-2 BPE tokenizer
+datasets>=2.19        # streaming + interleave_datasets
+accelerate>=0.30      # device placement helpers
+
+# Optional: convert this script to a Colab notebook
+#   jupytext --to notebook colab_trainable_dendritic_lm.py
+jupytext>=1.16
