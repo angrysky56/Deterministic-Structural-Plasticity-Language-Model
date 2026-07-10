@@ -527,7 +527,7 @@ class Config:
     # Curriculum.
     steps_per_substep: int = 3000  # try 500+ for a trial run (see token math note)
     log_every: int = 100
-    save_every: int = 3000  # also checkpoint every N optimizer steps (crash safety)
+    save_every: int = 250  # checkpoint latest.pt every N optimizer steps (crash/resume safety)
 
     # Held-out evaluation: hold out the first eval_docs rows of each dataset
     # (train skips them), pack a few blocks each, and report eval loss at every
