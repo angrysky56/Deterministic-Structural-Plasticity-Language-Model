@@ -520,11 +520,12 @@ class Config:
     # checkpoint to distinguish generalisation from memorisation.
     eval_docs: int = 200
     eval_blocks_per: int = 3
-    # Chat template is always applied (teaches User/Assistant turn structure).
-    # Prompt-masking is OFF by default: for a from-scratch base model you want
-    # every token to teach, and long formal prompts otherwise leave whole packed
-    # blocks fully masked (wasted compute, risk of all-ignored batches). Turn it
-    # ON for a later dedicated SFT/instruction-polish phase.
+    # BASE pretraining (default): plain-prose only, no User:/Assistant: template.
+    # This stops the model learning chat scaffolding as a generation attractor
+    # or regurgitating templated prompts (e.g. reasoning-core's "Premise: ...").
+    # Set chat_format=True (and usually mask_prompt_loss=True) for a later SFT
+    # phase to teach turn-taking; supervise only the response then.
+    chat_format: bool = False
     mask_prompt_loss: bool = False
 
     output_dir: str = "./checkpoints/DSP_LM"
@@ -651,12 +652,16 @@ def make_formatters():
     }
 
 
-def encode_example(name, item, formatters, tokenizer, mask_prompt):
+def encode_example(name, item, formatters, tokenizer, mask_prompt, chat_format):
     """Tokenise one (dataset-name, row) into (ids, loss_mask).
 
     loss_mask[i] == 1 -> token i is supervised; 0 -> ignored (prompt tokens).
-    Provenance is known (the multiplexer tags each row with its dataset), so we
-    apply exactly that dataset's formatter — no schema guessing.
+
+    chat_format=False (BASE pretraining): everything is plain prose — Q&A rows
+    are concatenated "prompt\\n\\nresponse". No User:/Assistant: scaffolding, so
+    the model never learns to emit it or to regurgitate templated prompts.
+    chat_format=True (SFT): wrap in the User/Assistant template and (optionally)
+    mask the prompt so only the response is supervised.
     """
     r = formatters[name](item)
     if r is None:
@@ -664,11 +669,15 @@ def encode_example(name, item, formatters, tokenizer, mask_prompt):
 
     is_instruction, prompt, response = r
     eos = tokenizer.eos_token_id
-    if is_instruction:
+    if is_instruction and chat_format:
         pre = tokenizer.encode(CHAT_TEMPLATE.format(prompt=prompt))
         ans = tokenizer.encode(f" {response}") + [eos]
         ids = pre + ans
         mask = ([0] * len(pre) + [1] * len(ans)) if mask_prompt else [1] * len(ids)
+    elif is_instruction:
+        # Base pretraining: plain-text concatenation, fully supervised.
+        ids = tokenizer.encode(f"{prompt}\n\n{response}") + [eos]
+        mask = [1] * len(ids)
     else:
         ids = tokenizer.encode(response) + [eos]
         mask = [1] * len(ids)
@@ -725,12 +734,14 @@ class PackedTokenStream:
     by EOS (added inside encode_example).
     """
 
-    def __init__(self, multiplex, formatters, tokenizer, seq_len, mask_prompt=True):
+    def __init__(self, multiplex, formatters, tokenizer, seq_len,
+                 mask_prompt=True, chat_format=False):
         self.mux = iter(multiplex)
         self.formatters = formatters
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.mask_prompt = mask_prompt
+        self.chat_format = chat_format
         self.ids_buf: list[int] = []
         self.mask_buf: list[int] = []
 
@@ -744,7 +755,8 @@ class PackedTokenStream:
                     return None, None
                 break
             ids, mask = encode_example(
-                name, item, self.formatters, self.tokenizer, self.mask_prompt
+                name, item, self.formatters, self.tokenizer,
+                self.mask_prompt, self.chat_format,
             )
             if len(ids) > 5:
                 self.ids_buf.extend(ids)
@@ -856,17 +868,20 @@ def make_scheduler(cfg: Config, optimizer, total_steps: int):
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per):
+def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per,
+                      chat_format=False):
     """Pack a fixed set of held-out blocks (CPU tensors) **per dataset**.
 
     Returns ``dict[str, list[tuple[Tensor, Tensor]]]`` so callers can evaluate
-    on individual domains or a filtered subset.
+    on individual domains or a filtered subset. Uses the same format as training
+    (plain prose for the base run) so eval loss is comparable.
     """
     blocks_by_name: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
     for name, ds in eval_loaded.items():
         mux = WeightedMultiplex([ds], [1.0], [name], seed=0)
         stream = PackedTokenStream(
-            mux, formatters, tokenizer, seq_len, mask_prompt=False
+            mux, formatters, tokenizer, seq_len,
+            mask_prompt=False, chat_format=chat_format,
         )
         ds_blocks: list[tuple[torch.Tensor, torch.Tensor]] = []
         for _ in range(blocks_per):
@@ -1177,7 +1192,8 @@ def main(
 
     print("Building held-out eval blocks...")
     eval_blocks_by_name = build_eval_blocks(
-        eval_loaded, formatters, tokenizer, cfg.seq_len, cfg.eval_blocks_per
+        eval_loaded, formatters, tokenizer, cfg.seq_len, cfg.eval_blocks_per,
+        cfg.chat_format,
     )
     total_blocks = sum(len(v) for v in eval_blocks_by_name.values())
     print(f"  {total_blocks} eval blocks held out across {list(eval_blocks_by_name)}")
@@ -1305,7 +1321,8 @@ def main(
                 [loaded[n] for n in names], weights, names, seed=3407 + substep_idx
             )
             stream = PackedTokenStream(
-                mux, formatters, tokenizer, cfg.seq_len, cfg.mask_prompt_loss
+                mux, formatters, tokenizer, cfg.seq_len,
+                cfg.mask_prompt_loss, cfg.chat_format,
             )
             streams = [stream]  # single packed stream; batch draws multiple blocks
 
