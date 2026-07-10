@@ -37,6 +37,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -1192,6 +1193,7 @@ def main(resume_override: bool | None = None) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             ema = None
+            t_log, tok_log = time.time(), tokens_seen  # throughput window
             for step in range(cfg.steps_per_substep):
                 model.train()
                 x, y = get_packed_batch(streams, cfg.batch_size, device)
@@ -1237,10 +1239,14 @@ def main(resume_override: bool | None = None) -> None:
                         )
 
                 if step % cfg.log_every == 0 or step == cfg.steps_per_substep - 1:
+                    dt = max(1e-6, time.time() - t_log)
+                    tps = (tokens_seen - tok_log) / dt  # tokens/sec since last log
+                    t_log, tok_log = time.time(), tokens_seen
                     print(
                         f"  [{phase['name']} | sub {substep_idx + 1}] step {step:04d} "
                         f"| loss {lv:.4f} (ema {ema:.4f}) | ppl {math.exp(min(20, ema)):8.1f} "
-                        f"| lr {scheduler.get_last_lr()[0]:.2e} | {tokens_seen / 1e6:.1f}M tok"
+                        f"| lr {scheduler.get_last_lr()[0]:.2e} | {tokens_seen / 1e6:.1f}M tok "
+                        f"| {tps / 1e3:.1f}K tok/s"
                     )
 
             # Flush trailing accumulated gradients only if the last

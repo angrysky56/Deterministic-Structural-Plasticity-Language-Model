@@ -119,6 +119,8 @@ base training; turn on for a later instruction-tuning pass).
 - [ ] Instruction-tuning pass (`mask_prompt_loss = True`)
 - [ ] Recurrent inference for O(1)-per-token generation — see
       [`docs/recurrent_inference.md`](docs/recurrent_inference.md)
+- [ ] Developmental structural plasticity (overproduce branches, then prune on a
+      curriculum schedule) — see [`docs/developmental_sparsity.md`](docs/developmental_sparsity.md)
 
 ## References
 
