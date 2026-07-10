@@ -96,7 +96,7 @@ notebook's first cell so a fresh Colab runtime has its dependencies.)
 
 ## Usage
 
-Pick a model size via `Config.preset` (`42m`, `110m`, `500m` default, `1b`), then:
+Pick a model size via `Config.preset` (`42m`, `110m` default, `500m`, `1b`), then:
 
 | Command                                  | What it does                                                                                                                                             |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -112,6 +112,17 @@ Quick self-test (tiny model, learnable synthetic task, no downloads):
 ```bash
 DSP_SMOKE=1 uv run python colab_trainable_dendritic_lm.py
 ```
+
+You can pick the size from the CLI, in any order with the command word:
+
+```bash
+uv run python colab_trainable_dendritic_lm.py 110m              # train 110m (resume if it exists)
+uv run python colab_trainable_dendritic_lm.py overwrite 110m    # fresh 110m run
+uv run python colab_trainable_dendritic_lm.py 1b continue       # continued-pretrain the 1b
+uv run python colab_trainable_dendritic_lm.py clean 500m        # wipe just the 500m checkpoints
+```
+
+It prints the resolved preset and output dir at startup so you can confirm before it commits. chat.py matches — --preset 110m loads that size's checkpoint (or pass --checkpoint explicitly).
 
 Chat / generate from a checkpoint (recurrent, unbounded-context inference):
 
@@ -154,11 +165,19 @@ train the same model across multiple Colab sessions.
 - [ ] Instruction-tuning pass (`mask_prompt_loss = True`, re-add orca/alpaca)
 - [ ] Developmental structural plasticity (overproduce branches, prune on a
       schedule) — see [`docs/developmental_sparsity.md`](docs/developmental_sparsity.md)
+- [ ] (optional) Physics diagnostics — per-channel half-lives, impulse response,
+      spectral decomposition, suffix-perturbation causality test
+- [ ] (frontier) Mamba-style input-dependent selectivity in the SSM
 
 ## References
 
 - Gu, Gupta, Goel, Ré — _On the Parameterization and Initialization of Diagonal
-  State Space Models_ (S4D), NeurIPS 2022. The damped-complex-pole resonator.
+  State Space Models_ (S4D), NeurIPS 2022. The damped-complex-pole resonator our
+  temporal mixer is built on.
+- Chaudhury — _ResonatorLM: Causal Resonant Field Mixing for Efficient
+  Long-Context Language Modeling_, 2026 (arXiv:2607.05583). Independent
+  validation of damped-resonator sequence mixing; our diagonal SSM is a
+  multi-mode generalisation of its single-damped-cosine-per-head kernel.
 - Beniaguev, Segev, London — _Single cortical neurons as deep artificial neural
   networks_, Neuron 2021. Dendritic branches as local nonlinear units.
 

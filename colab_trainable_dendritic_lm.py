@@ -482,7 +482,7 @@ MODEL_PRESETS = {
 @dataclass
 class Config:
     # Pick model scale here; override any field below to customise.
-    preset: str = "500m"
+    preset: str = "110m"
 
     # Architecture — left None to inherit from the preset.
     d_model: int | None = None
@@ -570,6 +570,9 @@ class Config:
         for key, value in MODEL_PRESETS[self.preset].items():
             if getattr(self, key) is None:
                 setattr(self, key, value)
+        # Key checkpoints by preset so different sizes never overwrite each other
+        # (local dir and HF Hub subfolder both become e.g. .../DSP_LM/110m).
+        self.output_dir = os.path.join(self.output_dir, self.preset)
 
 
 # ==========================================================================
@@ -989,11 +992,12 @@ def _is_colab() -> bool:
         return False
 
 
-def hf_push_checkpoint(hf_repo: str, output_dir: str) -> None:
+def hf_push_checkpoint(hf_repo: str, output_dir: str, subdir: str = "") -> None:
     """Push the checkpoint directory to a private Hugging Face Hub repo.
 
-    Creates the repo on first call. Subsequent calls update it in-place.
-    Requires ``huggingface-cli login`` or ``HF_TOKEN`` env var.
+    ``subdir`` (the model-size preset) keeps each size in its own folder in the
+    repo so sizes never overwrite each other. Requires ``huggingface-cli login``
+    or an ``HF_TOKEN`` env var.
     """
     from huggingface_hub import HfApi
 
@@ -1002,26 +1006,32 @@ def hf_push_checkpoint(hf_repo: str, output_dir: str) -> None:
     api.upload_folder(
         repo_id=hf_repo,
         folder_path=output_dir,
-        commit_message="checkpoint update",
+        path_in_repo=subdir or ".",
+        commit_message=f"checkpoint update ({subdir or 'root'})",
     )
-    print(f"  Pushed checkpoint to https://huggingface.co/{hf_repo}")
+    print(f"  Pushed checkpoint to https://huggingface.co/{hf_repo}/{subdir}")
 
 
-def hf_pull_checkpoint(hf_repo: str, output_dir: str) -> bool:
-    """Download checkpoints from Hugging Face Hub into output_dir.
+def hf_pull_checkpoint(hf_repo: str, output_dir: str, subdir: str = "") -> bool:
+    """Download this size's checkpoints from the Hub into output_dir.
 
-    Returns True if a checkpoint was found, False otherwise.
+    Returns True if the pull succeeded. Only the ``subdir`` (preset) folder is
+    fetched, and it lands directly in output_dir.
     """
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import RepositoryNotFoundError
 
     try:
+        # output_dir ends in the preset; download repo/<preset>/* into its parent
+        # so files land back in output_dir.
+        parent = os.path.dirname(output_dir.rstrip("/")) or "."
         snapshot_download(
             repo_id=hf_repo,
-            local_dir=output_dir,
+            local_dir=parent if subdir else output_dir,
+            allow_patterns=[f"{subdir}/*"] if subdir else None,
             local_dir_use_symlinks=False,
         )
-        print(f"  Pulled checkpoint from https://huggingface.co/{hf_repo}")
+        print(f"  Pulled checkpoint from https://huggingface.co/{hf_repo}/{subdir}")
         return True
     except RepositoryNotFoundError:
         print(f"  No remote checkpoint found at {hf_repo}")
@@ -1031,8 +1041,11 @@ def hf_pull_checkpoint(hf_repo: str, output_dir: str) -> bool:
         return False
 
 
-def hf_clean(hf_repo: str, output_dir: str) -> None:
-    """Delete local checkpoints AND the remote HF Hub repo."""
+def hf_clean(hf_repo: str, output_dir: str, subdir: str = "") -> None:
+    """Delete this size's local checkpoints and its remote Hub folder.
+
+    Only the current preset is removed; other sizes in the repo are left alone.
+    """
     import shutil
 
     if os.path.exists(output_dir):
@@ -1041,22 +1054,26 @@ def hf_clean(hf_repo: str, output_dir: str) -> None:
     else:
         print("  No local checkpoints to delete.")
 
-    if hf_repo:
+    if hf_repo and subdir:
         from huggingface_hub import HfApi
-        from huggingface_hub.utils import RepositoryNotFoundError
 
         try:
-            HfApi().delete_repo(repo_id=hf_repo)
-            print(f"  Deleted remote repo: {hf_repo}")
-        except RepositoryNotFoundError:
-            print("  No remote repo to delete.")
+            HfApi().delete_folder(path_in_repo=subdir, repo_id=hf_repo)
+            print(f"  Deleted remote folder: {hf_repo}/{subdir}")
+        except Exception as exc:
+            print(f"  Could not delete remote folder ({type(exc).__name__}: {exc})")
 
 
-def main(resume_override: bool | None = None, continue_stage: bool = False) -> None:
+def main(
+    resume_override: bool | None = None,
+    continue_stage: bool = False,
+    preset: str | None = None,
+) -> None:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    cfg = Config()
+    cfg = Config(preset=preset) if preset else Config()
+    print(f"Preset: {cfg.preset} ({cfg.d_model}d x {cfg.depth}L) -> {cfg.output_dir}")
     if resume_override is not None:
         cfg.resume = resume_override  # CLI 'resume' / 'overwrite' switch
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1076,7 +1093,7 @@ def main(resume_override: bool | None = None, continue_stage: bool = False) -> N
     # On Colab with hf_repo configured, pull latest checkpoint for resume/continue.
     if _is_colab() and cfg.hf_repo and (cfg.resume or continue_stage):
         print("Checking HF Hub for existing checkpoint...")
-        hf_pull_checkpoint(cfg.hf_repo, cfg.output_dir)
+        hf_pull_checkpoint(cfg.hf_repo, cfg.output_dir, cfg.preset)
 
     print(f"Checkpoint directory: {cfg.output_dir}")
 
@@ -1348,7 +1365,7 @@ def main(resume_override: bool | None = None, continue_stage: bool = False) -> N
             # Push to HF Hub so checkpoints survive Colab restarts.
             if cfg.hf_repo:
                 try:
-                    hf_push_checkpoint(cfg.hf_repo, cfg.output_dir)
+                    hf_push_checkpoint(cfg.hf_repo, cfg.output_dir, cfg.preset)
                 except Exception as exc:
                     print(f"  HF push failed (non-fatal): {exc}")
 
@@ -1365,38 +1382,36 @@ def main(resume_override: bool | None = None, continue_stage: bool = False) -> N
 if __name__ == "__main__":
     import sys
 
-    # Colab/Jupyter injects arguments like `-f /root/.../kernel.json`.
-    # Only intercept if the argument is exactly one of our CLI commands.
-    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    # Colab/Jupyter injects arguments like `-f /root/.../kernel.json`. Parse only
+    # the tokens we recognise: a command word and/or a size preset, in any order.
+    # e.g.  `... 110m`  `... overwrite 110m`  `... 1b continue`  `... clean 500m`
+    args = [a.lower() for a in sys.argv[1:]]
+    preset = next((a for a in args if a in MODEL_PRESETS), None)
+    commands = {"pull", "push", "clean", "overwrite", "fresh", "restart", "resume", "continue", "extend"}
+    cmd = next((a for a in args if a in commands), "")
+
     if cmd in ["pull", "push", "clean"]:
-        cfg = Config()
+        cfg = Config(preset=preset) if preset else Config()
         if cmd == "pull":
-            # Download checkpoints from HF Hub into the local project.
             if not cfg.hf_repo:
                 print("Error: set hf_repo in Config first.")
                 sys.exit(1)
-            hf_pull_checkpoint(cfg.hf_repo, cfg.output_dir)
+            hf_pull_checkpoint(cfg.hf_repo, cfg.output_dir, cfg.preset)
         elif cmd == "clean":
-            # Wipe local checkpoints AND the remote HF repo.
-            hf_clean(cfg.hf_repo, cfg.output_dir)
+            # Wipe THIS size's local checkpoints + its remote Hub folder.
+            hf_clean(cfg.hf_repo, cfg.output_dir, cfg.preset)
         elif cmd == "push":
-            # Manually push local checkpoints to HF Hub.
             if not cfg.hf_repo:
                 print("Error: set hf_repo in Config first.")
                 sys.exit(1)
-            hf_push_checkpoint(cfg.hf_repo, cfg.output_dir)
+            hf_push_checkpoint(cfg.hf_repo, cfg.output_dir, cfg.preset)
     elif cmd in ["overwrite", "fresh", "restart"]:
-        # Start a fresh run, ignoring any existing checkpoint. (Existing
-        # checkpoints are left on disk and overwritten as training saves; use
-        # the `clean` command to wipe them entirely first.)
-        main(resume_override=False)
+        main(resume_override=False, preset=preset)  # fresh run
     elif cmd == "resume":
-        main(resume_override=True)  # force-resume from latest checkpoint
+        main(resume_override=True, preset=preset)  # force-resume
     elif cmd in ["continue", "extend"]:
-        # Continued pretraining: keep the trained WEIGHTS, run a new stage on
-        # the current (possibly new) data mix with a fresh schedule. Add
-        # datasets without a restart. Model architecture must match the
-        # checkpoint (same preset).
-        main(continue_stage=True)
+        # Continued pretraining: keep the trained WEIGHTS, run a new stage on the
+        # current data mix with a fresh schedule. Architecture must match.
+        main(continue_stage=True, preset=preset)
     else:
-        main()  # default: uses cfg.resume (resume if a checkpoint exists)
+        main(preset=preset)  # default: resume if a checkpoint exists

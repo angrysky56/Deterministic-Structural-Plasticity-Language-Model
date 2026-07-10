@@ -92,7 +92,10 @@ def stream_text(token_iter, tokenizer) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="DSP-LM interactive CLI")
-    ap.add_argument("--checkpoint", default="checkpoints/DSP_LM/latest.pt")
+    ap.add_argument("--preset", default="110m",
+                    help="model size to load (checkpoints are size-keyed)")
+    ap.add_argument("--checkpoint", default=None,
+                    help="explicit checkpoint path (overrides --preset)")
     ap.add_argument("--chat", action="store_true", help="use User/Assistant template")
     ap.add_argument("--prompt", default=None, help="one-shot prompt (skips the REPL)")
     ap.add_argument("-n", "--max-new", type=int, default=60)
@@ -102,6 +105,8 @@ def main() -> None:
                     help="0 = unbounded (SSM has no context limit); >0 caps the "
                          "FFT-path prefix per step as a compute guard")
     args = ap.parse_args()
+    if args.checkpoint is None:
+        args.checkpoint = f"checkpoints/DSP_LM/{args.preset}/latest.pt"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
