@@ -40,6 +40,10 @@ import random
 import time
 from dataclasses import dataclass, field
 
+# Reduce CUDA fragmentation OOMs (the large logits tensor is the usual culprit).
+# Must be set before torch initialises CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -503,6 +507,9 @@ class Config:
     weight_decay: float = 0.1
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
+    # z-loss: tiny penalty on logit magnitude (log-sum-exp^2). Stabilises SSM
+    # training and prevents loss spikes / logit blow-up (as in PaLM, Gemma).
+    z_loss_weight: float = 1e-4
     min_lr_ratio: float = 0.1  # LR floor at the end of the final decay
     # WSD schedule: warmup -> stable plateau at full LR -> decay only over the
     # final fraction of training. Keeps every curriculum phase at full LR
@@ -894,6 +901,20 @@ def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per,
     return blocks_by_name
 
 
+def lm_loss(logits, targets, vocab_size, z_weight=0.0):
+    """Cross-entropy plus an optional z-loss (penalises logit magnitude).
+
+    z-loss = z_weight * mean(logsumexp(logits)^2); computed from the same logits
+    with no large fp32 upcast, so it adds negligible memory.
+    """
+    flat = logits.view(-1, vocab_size)
+    loss = F.cross_entropy(flat, targets.view(-1))
+    if z_weight:
+        z = torch.logsumexp(flat, dim=-1)
+        loss = loss + z_weight * (z.float() ** 2).mean()
+    return loss
+
+
 @torch.no_grad()
 def evaluate(model, blocks, vocab_size, device):
     """Mean cross-entropy over a flat list of held-out blocks."""
@@ -1142,6 +1163,21 @@ def main(
         cfg.resume = resume_override  # CLI 'resume' / 'overwrite' switch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+
+    # Preset batch sizes are tuned for an 80GB A100. Colab often hands out a
+    # 40GB A100, where the fp32 logits in cross_entropy (batch*seq*vocab) OOM.
+    # Auto-scale the microbatch to the detected VRAM, keeping effective batch
+    # constant (raise grad_accum). Override cfg.batch_size manually to opt out.
+    if device == "cuda":
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        if total_gb < 70:
+            eff = cfg.batch_size * cfg.grad_accum
+            cfg.batch_size = max(2, int(cfg.batch_size * total_gb / 80))
+            cfg.grad_accum = max(1, eff // cfg.batch_size)
+            print(
+                f"GPU {total_gb:.0f}GB (<80GB) -> scaled to batch {cfg.batch_size} "
+                f"x accum {cfg.grad_accum} (effective {cfg.batch_size * cfg.grad_accum})"
+            )
     if continue_stage:
         mode = "CONTINUE (load weights, fresh schedule, new data stage)"
     elif cfg.resume:
@@ -1345,10 +1381,10 @@ def main(
                 if device == "cuda":
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits = model(x)
-                        loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+                        loss = lm_loss(logits, y, vocab_size, cfg.z_loss_weight)
                 else:
                     logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+                    loss = lm_loss(logits, y, vocab_size, cfg.z_loss_weight)
 
                 (loss / cfg.grad_accum).backward()
                 tokens_seen += x.numel()
