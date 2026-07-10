@@ -478,11 +478,15 @@ class VectorizedDendriticLM(nn.Module):
 # to keep the same effective batch). On a 40GB A100 or a 12GB card, halve/quarter
 # batch_size. To trade the freed VRAM for ~30% more speed instead, you can also
 # set use_checkpoint=False (works at smaller batch; it OOMs with a big batch).
+# batch sizes assume fused cross-entropy (logits are no longer the memory sink),
+# so memory is activation-bound (~0.2GB/sample for 110m). Tuned to use ~30-45GB
+# of an 80GB A100; raise batch_size to fill more (watch the GPU gauge). The
+# auto-scaler in main() shrinks these on smaller cards.
 MODEL_PRESETS = {
-    "42m":  {"d_model": 512,  "depth": 6,  "branch_dim": 256,  "batch_size": 48, "grad_accum": 2, "lr": 3e-4},
-    "110m": {"d_model": 768,  "depth": 12, "branch_dim": 384,  "batch_size": 48, "grad_accum": 2, "lr": 3e-4},
-    "500m": {"d_model": 1536, "depth": 18, "branch_dim": 768,  "batch_size": 32, "grad_accum": 3, "lr": 2e-4},
-    "1b":   {"d_model": 2048, "depth": 22, "branch_dim": 1024, "batch_size": 16, "grad_accum": 6, "lr": 1.5e-4},
+    "42m":  {"d_model": 512,  "depth": 6,  "branch_dim": 256,  "batch_size": 256, "grad_accum": 1, "lr": 3e-4},
+    "110m": {"d_model": 768,  "depth": 12, "branch_dim": 384,  "batch_size": 128, "grad_accum": 2, "lr": 3e-4},
+    "500m": {"d_model": 1536, "depth": 18, "branch_dim": 768,  "batch_size": 48,  "grad_accum": 4, "lr": 2e-4},
+    "1b":   {"d_model": 2048, "depth": 22, "branch_dim": 1024, "batch_size": 24,  "grad_accum": 4, "lr": 1.5e-4},
 }
 
 
