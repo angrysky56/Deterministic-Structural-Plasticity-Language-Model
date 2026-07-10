@@ -120,6 +120,7 @@ uv run python colab_trainable_dendritic_lm.py 110m              # train 110m (re
 uv run python colab_trainable_dendritic_lm.py overwrite 110m    # fresh 110m run
 uv run python colab_trainable_dendritic_lm.py 1b continue       # continued-pretrain the 1b
 uv run python colab_trainable_dendritic_lm.py clean 500m        # wipe just the 500m checkpoints
+uv run python colab_trainable_dendritic_lm.py diagnose 110m   # anytime, on a checkpoint
 ```
 
 It prints the resolved preset and output dir at startup so you can confirm before it commits. chat.py matches — --preset 110m loads that size's checkpoint (or pass --checkpoint explicitly).

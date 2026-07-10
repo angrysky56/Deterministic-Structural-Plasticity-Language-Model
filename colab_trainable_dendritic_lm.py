@@ -497,7 +497,10 @@ class Config:
     batch_size: int | None = None
     grad_accum: int | None = None
     lr: float | None = None
-    weight_decay: float = 0.01
+    # 0.1 is standard (Chinchilla/Llama). Data-constrained scaling work (Lovelace
+    # et al. 2026) finds strong decay ~1.0 cuts repetition-overfitting ~70%; go
+    # higher (up to ~1.0) if you lean heavily on small/repeated domains.
+    weight_decay: float = 0.1
     warmup_steps: int = 100
     max_grad_norm: float = 1.0
     min_lr_ratio: float = 0.1  # LR floor at the end of the final decay
@@ -918,6 +921,52 @@ def evaluate_per_dataset(
     return per_ds, avg
 
 
+@torch.no_grad()
+def ssm_diagnostics(model) -> dict:
+    """Interpretability readout of the resonator poles (à la ResonatorLM's
+    physics diagnostics): the timescales the SSM has learned to occupy.
+
+    Per channel/state: effective per-step damping alpha = exp(log_A_real)*dt, so
+    half-life = ln2 / alpha (in tokens); frequency = |A_imag| * dt (rad/step).
+    A healthy model spreads half-lives across short and long timescales rather
+    than collapsing to one regime.
+    """
+    half_lives, freqs = [], []
+    for blk in model.blocks:
+        k = blk.ssm.kernel
+        dt = torch.exp(k.log_dt).unsqueeze(-1)            # (H, 1)
+        alpha = (torch.exp(k.log_A_real) * dt).clamp_min(1e-8)  # (H, N/2)
+        half_lives.append((math.log(2) / alpha).flatten().float())
+        freqs.append((k.A_imag.abs() * dt).flatten().float())
+    hl = torch.cat(half_lives)
+    fr = torch.cat(freqs)
+    qs = torch.quantile(hl, torch.tensor([0.05, 0.5, 0.95], device=hl.device))
+    return {
+        "channels": hl.numel(),
+        "half_life_tokens": {
+            "p5": round(qs[0].item(), 1),
+            "median": round(qs[1].item(), 1),
+            "p95": round(qs[2].item(), 1),
+            "max": round(hl.max().item(), 1),
+        },
+        "freq_rad_per_step": {
+            "min": round(fr.min().item(), 4),
+            "max": round(fr.max().item(), 4),
+        },
+        "frac_longmemory_gt_1024tok": round((hl > 1024).float().mean().item(), 3),
+    }
+
+
+def print_ssm_diagnostics(model) -> None:
+    d = ssm_diagnostics(model)
+    hl = d["half_life_tokens"]
+    print(
+        f"SSM resonators: {d['channels']} modes | half-life tokens "
+        f"p5={hl['p5']} median={hl['median']} p95={hl['p95']} max={hl['max']} | "
+        f"{d['frac_longmemory_gt_1024tok']:.0%} long-memory (>1024 tok)"
+    )
+
+
 def smoke_test(cfg: Config, device: str) -> None:
     """Validate the whole train step on a LEARNABLE synthetic task.
 
@@ -1109,6 +1158,7 @@ def main(
 
     model, optimizer = build_model_and_optim(cfg, vocab_size, device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+    print_ssm_diagnostics(model)  # timescale coverage at init
 
     # Robust dataset loading: drop anything that fails. Each dataset is split
     # into a held-out eval set (first eval_docs rows) and a train set (the rest)
@@ -1360,6 +1410,8 @@ def main(
             print(
                 f"  eval (active avg) loss {ev:.4f} | ppl {math.exp(min(20, ev)):.1f}"
             )
+            print("  ", end="")
+            print_ssm_diagnostics(model)  # how the resonators have evolved
             print(f"  sample: {sample()[:200]!r}")
 
             # Push to HF Hub so checkpoints survive Colab restarts.
@@ -1387,8 +1439,27 @@ if __name__ == "__main__":
     # e.g.  `... 110m`  `... overwrite 110m`  `... 1b continue`  `... clean 500m`
     args = [a.lower() for a in sys.argv[1:]]
     preset = next((a for a in args if a in MODEL_PRESETS), None)
-    commands = {"pull", "push", "clean", "overwrite", "fresh", "restart", "resume", "continue", "extend"}
+    commands = {"pull", "push", "clean", "overwrite", "fresh", "restart",
+                "resume", "continue", "extend", "diagnose"}
     cmd = next((a for a in args if a in commands), "")
+
+    if cmd == "diagnose":
+        # Print the SSM resonator timescale readout for a size (loads its
+        # checkpoint weights if present; otherwise shows the init spread).
+        cfg = Config(preset=preset) if preset else Config()
+        m = VectorizedDendriticLM(
+            vocab_size=50257, d_model=cfg.d_model, depth=cfg.depth,
+            n_states=cfg.n_states, num_branches=cfg.num_branches,
+            branch_dim=cfg.branch_dim, use_checkpoint=False,
+        )
+        latest = os.path.join(cfg.output_dir, "latest.pt")
+        if os.path.exists(latest):
+            m.load_state_dict(torch.load(latest, map_location="cpu")["model"])
+            print(f"[{cfg.preset}] diagnostics from {latest}:")
+        else:
+            print(f"[{cfg.preset}] no checkpoint; diagnostics at init:")
+        print_ssm_diagnostics(m)
+        sys.exit(0)
 
     if cmd in ["pull", "push", "clean"]:
         cfg = Config(preset=preset) if preset else Config()
