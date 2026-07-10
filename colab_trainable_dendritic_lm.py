@@ -375,14 +375,17 @@ class VectorizedDendriticLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_hidden: bool = False) -> torch.Tensor:
         x = self.embedding(x)
         for block in self.blocks:
             if self.use_checkpoint and self.training:
                 x = checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x)
-        return self.lm_head(self.norm_out(x))
+        x = self.norm_out(x)
+        # return_hidden lets the loss compute logits in chunks (fused CE) so the
+        # full (B, T, vocab) tensor is never materialised — the main memory sink.
+        return x if return_hidden else self.lm_head(x)
 
     # -- Recurrent (generation) interface --------------------------------
 
@@ -901,17 +904,39 @@ def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per,
     return blocks_by_name
 
 
-def lm_loss(logits, targets, vocab_size, z_weight=0.0):
-    """Cross-entropy plus an optional z-loss (penalises logit magnitude).
-
-    z-loss = z_weight * mean(logsumexp(logits)^2); computed from the same logits
-    with no large fp32 upcast, so it adds negligible memory.
-    """
-    flat = logits.view(-1, vocab_size)
-    loss = F.cross_entropy(flat, targets.view(-1))
+def _chunk_ce_z(hidden_chunk, head_weight, target_chunk, z_weight):
+    """Loss contributions for one chunk of tokens (checkpointed in backward)."""
+    logits = (hidden_chunk @ head_weight.t()).float()  # (chunk, vocab)
+    ce = F.cross_entropy(logits, target_chunk, ignore_index=-100, reduction="sum")
     if z_weight:
-        z = torch.logsumexp(flat, dim=-1)
-        loss = loss + z_weight * (z.float() ** 2).mean()
+        z = torch.logsumexp(logits, dim=-1)  # (chunk,)
+        zsum = (z * z).sum()
+    else:
+        zsum = logits.new_zeros(())
+    return ce, zsum
+
+
+def fused_lm_loss(hidden, head_weight, targets, z_weight=0.0, chunk=2048):
+    """Cross-entropy (+ optional z-loss) computed from hidden states in chunks.
+
+    The full (B, T, vocab) logits tensor is never materialised — it is the
+    single largest allocation in the model. Instead each chunk of tokens is
+    projected to logits, scored, and (via checkpointing) recomputed in the
+    backward pass, so peak logit memory is one chunk, not the whole batch.
+    """
+    h = hidden.reshape(-1, hidden.size(-1))  # (N, d)
+    t = targets.reshape(-1)                   # (N,)
+    n_valid = (t != -100).sum().clamp_min(1)
+    ce_sum = h.new_zeros((), dtype=torch.float32)
+    z_sum = h.new_zeros((), dtype=torch.float32)
+    for i in range(0, h.size(0), chunk):
+        hc, tc = h[i : i + chunk], t[i : i + chunk]
+        ce, zs = checkpoint(_chunk_ce_z, hc, head_weight, tc, z_weight, use_reentrant=False)
+        ce_sum = ce_sum + ce
+        z_sum = z_sum + zs
+    loss = ce_sum / n_valid
+    if z_weight:
+        loss = loss + z_weight * z_sum / h.size(0)
     return loss
 
 
@@ -1380,11 +1405,11 @@ def main(
 
                 if device == "cuda":
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        logits = model(x)
-                        loss = lm_loss(logits, y, vocab_size, cfg.z_loss_weight)
+                        hidden = model(x, return_hidden=True)
+                        loss = fused_lm_loss(hidden, model.lm_head.weight, y, cfg.z_loss_weight)
                 else:
-                    logits = model(x)
-                    loss = lm_loss(logits, y, vocab_size, cfg.z_loss_weight)
+                    hidden = model(x, return_hidden=True)
+                    loss = fused_lm_loss(hidden, model.lm_head.weight, y, cfg.z_loss_weight)
 
                 (loss / cfg.grad_accum).backward()
                 tokens_seen += x.numel()
