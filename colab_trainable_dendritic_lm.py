@@ -865,6 +865,44 @@ def build_model_and_optim(cfg: Config, vocab_size: int, device: str):
     return model, optimizer
 
 
+def fit_batch_size(model, cfg, vocab_size, device):
+    """Probe one forward+backward at cfg.batch_size, halving on CUDA OOM until it
+    fits. Modifies cfg.batch_size / cfg.grad_accum in place (effective batch kept
+    roughly constant). Ends the OOM guessing game — it self-tunes to the card,
+    the model size, and the gradient-checkpointing setting.
+    """
+    if device != "cuda":
+        return
+    model.train()
+    b = cfg.batch_size
+    while b >= 1:
+        try:
+            torch.cuda.empty_cache()
+            x = torch.randint(0, vocab_size, (b, cfg.seq_len), device=device)
+            y = torch.randint(0, vocab_size, (b, cfg.seq_len), device=device)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                hidden = model(x, return_hidden=True)
+                loss = fused_lm_loss(hidden, model.lm_head.weight, y, cfg.z_loss_weight)
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+            del x, y, hidden, loss
+            torch.cuda.empty_cache()
+            break
+        except torch.cuda.OutOfMemoryError:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            b //= 2
+            print(f"  batch probe OOM -> retrying at batch {b}")
+    b = max(1, b)
+    if b != cfg.batch_size:
+        eff = cfg.batch_size * cfg.grad_accum
+        cfg.batch_size = b
+        cfg.grad_accum = max(1, eff // b)
+        print(f"Auto-fit batch -> {b} x accum {cfg.grad_accum} (effective {b * cfg.grad_accum})")
+    else:
+        print(f"Batch {b} fits.")
+
+
 def make_scheduler(cfg: Config, optimizer, total_steps: int):
     """WSD: linear warmup -> stable plateau at full LR -> final decay to floor."""
     decay_steps = int(total_steps * cfg.decay_frac)
@@ -1239,6 +1277,7 @@ def main(
     model, optimizer = build_model_and_optim(cfg, vocab_size, device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     print_ssm_diagnostics(model)  # timescale coverage at init
+    fit_batch_size(model, cfg, vocab_size, device)  # probe VRAM; never OOM on batch again
 
     # Robust dataset loading: drop anything that fails. Each dataset is split
     # into a held-out eval set (first eval_docs rows) and a train set (the rest)
