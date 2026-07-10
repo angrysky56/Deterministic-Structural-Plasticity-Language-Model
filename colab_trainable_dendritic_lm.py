@@ -532,30 +532,34 @@ class Config:
     # repo on first push. Pull locally with: python colab_trainable_dendritic_lm.py pull
     hf_repo: str = "angrysky/dendritic-lm"  # e.g. "your_hf_name/dendritic-lm"
 
-    # Dataset slate: a balanced, non-gated, all-streamable "curriculum of
-    # courses". Each entry is (repo, config_or_None). All four share the spirit
-    # of the curriculum — formal reasoning, then course/textbook material.
+    # Dataset slate: balanced, non-gated, all-streamable. Each entry is
+    # (repo, config_or_None). "language" (fineweb-edu) is the general-English
+    # backbone — it teaches grammar, vocabulary and world knowledge, present in
+    # every phase so fluency is always reinforced (the formal/technical corpora
+    # alone would leave the model stilted).
     #
-    #   logic      reasoning-core/procedural-pretraining-pile  ~7.3GB / 3.1M rows  formal, correct-by-design
-    #   math       open-web-math/open-web-math                 14.7B tokens        never runs out
-    #   physics    millawell/wikipedia_field_of_science        ~9.6GB science wiki  broad science, never runs out
-    #   philosophy sayhan/strix-philosophy-qa                  ~391MB / 134k       philosophy Q&A (final phase)
-    #   qa         yahma/alpaca-cleaned                        ~40MB / 51k         general instruction Q&A (final phase)
+    #   language   HuggingFaceFW/fineweb-edu:sample-10BT      10B tokens          grammar + fluency + knowledge
+    #   logic      reasoning-core/procedural-pretraining-pile ~7.3GB / 3.1M rows  formal, correct-by-design
+    #   math       open-web-math/open-web-math                14.7B tokens        never runs out
+    #   physics    millawell/wikipedia_field_of_science       ~9.6GB science wiki broad science, never runs out
+    #   philosophy sayhan/strix-philosophy-qa                 ~391MB / 134k       philosophy Q&A (final phase)
     #
-    # Streaming means only the consumed slice is read; the big pools above are
-    # large enough that math/physics never cycle at these step counts. The small
-    # Q&A sets sit in the final phase at low weight (some cycling is fine there).
-    # Scale-up / swap options (all non-gated):
-    #   logic   -> ("reasoning-core/basic-procedural", None)      7.6M rows
-    #   physics -> ("HuggingFaceTB/cosmopedia", "openstax")       real physics textbooks, but only ~668MB (cycles)
-    #   math QA -> ("microsoft/orca-math-word-problems-200k")     reintroduce as SFT later
+    # Streaming reads only the consumed slice, so pool size is free; these pools
+    # are large enough that nothing cycles at these step counts. Q&A/instruction
+    # (alpaca, orca-math) is intentionally deferred to a later SFT phase, not the
+    # base run. Swap options (all non-gated):
+    #   grammar bootstrap -> ("roneneldan/TinyStories", None)     simple stories, teaches basic syntax
+    #   logic scale-up    -> ("reasoning-core/basic-procedural", None)   7.6M rows
+    #   humanities scale  -> ("HuggingFaceTB/cosmopedia", "stanford")    6.3GB (broader than philosophy)
     repos: dict = field(
         default_factory=lambda: {
+            "grammar": ("grammarly/coedit", None),          # explicit grammar correction
+            "language": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
             "logic": ("reasoning-core/procedural-pretraining-pile", None),
             "math": ("open-web-math/open-web-math", None),
             "physics": ("millawell/wikipedia_field_of_science", None),
             "philosophy": ("sayhan/strix-philosophy-qa", None),
-            "qa": ("yahma/alpaca-cleaned", None),
+            "humanities": ("HuggingFaceTB/cosmopedia", "stanford"),  # ~6.3GB academic prose
         }
     )
 
@@ -611,6 +615,12 @@ def make_formatters():
         prompt = f"{instr}\n{inp}" if isinstance(inp, str) and inp else instr
         return (True, prompt, out)
 
+    def coedit(item):  # CoEdIT: src (instruction+text) -> tgt (corrected)
+        s, t = item.get("src", ""), item.get("tgt", "")
+        if isinstance(s, str) and s and isinstance(t, str) and t:
+            return (True, s, t)
+        return None
+
     def prose(item):  # open-web-math / science-wiki: plain continuation ('text')
         t = item.get("text", "")
         if isinstance(t, str) and t:
@@ -621,13 +631,16 @@ def make_formatters():
                 return (False, "", v)
         return None
 
-    # math & physics are now large prose corpora; qa_pair/alpaca stay for the
-    # Q&A domains. (orca-math's qa_pair formatter is kept for a future SFT pass.)
+    # language/math/physics are large prose corpora; philosophy is Q&A.
+    # qa_pair/alpaca are kept defined for a future SFT pass (orca-math, alpaca).
     return {
+        "grammar": coedit,
+        "language": prose,
         "logic": logic,
         "math": prose,
         "physics": prose,
         "philosophy": qa_pair,
+        "humanities": prose,
         "qa": alpaca,
     }
 
@@ -1039,7 +1052,7 @@ def hf_clean(hf_repo: str, output_dir: str) -> None:
             print("  No remote repo to delete.")
 
 
-def main(resume_override: bool | None = None) -> None:
+def main(resume_override: bool | None = None, continue_stage: bool = False) -> None:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
@@ -1048,14 +1061,20 @@ def main(resume_override: bool | None = None) -> None:
         cfg.resume = resume_override  # CLI 'resume' / 'overwrite' switch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    print(f"Mode: {'RESUME from latest checkpoint' if cfg.resume else 'OVERWRITE (fresh start)'}")
+    if continue_stage:
+        mode = "CONTINUE (load weights, fresh schedule, new data stage)"
+    elif cfg.resume:
+        mode = "RESUME from latest checkpoint"
+    else:
+        mode = "OVERWRITE (fresh start)"
+    print(f"Mode: {mode}")
 
     if os.environ.get("DSP_SMOKE") == "1":
         smoke_test(cfg, device)
         return
 
-    # On Colab with hf_repo configured, pull latest checkpoint for resume.
-    if _is_colab() and cfg.hf_repo and cfg.resume:
+    # On Colab with hf_repo configured, pull latest checkpoint for resume/continue.
+    if _is_colab() and cfg.hf_repo and (cfg.resume or continue_stage):
         print("Checking HF Hub for existing checkpoint...")
         hf_pull_checkpoint(cfg.hf_repo, cfg.output_dir)
 
@@ -1096,42 +1115,74 @@ def main(resume_override: bool | None = None) -> None:
     total_blocks = sum(len(v) for v in eval_blocks_by_name.values())
     print(f"  {total_blocks} eval blocks held out across {list(eval_blocks_by_name)}")
 
+    # Bloom-style progression: an explicit-language foundation (grammar drills +
+    # simple correct stories + general prose) BEFORE the reasoning phases, then
+    # the logic->math->physics->philosophy curriculum. 'language' (fineweb-edu)
+    # stays on as a fluency backbone throughout. A phase may set "steps" to run
+    # shorter than the global default (Phase 0 is a brief primer so the small
+    # grammar sets don't over-repeat). Weights are auto-renormalised.
     phases = [
         {
-            "name": "Phase_1_Logic_Dominant",
-            "desc": "Foundational Logic (90/10)",
-            "datasets": ["logic", "math"],
-            "mixtures": [[0.90, 0.10]],
+            "name": "Phase_0_Language_Rules",
+            "desc": "Explicit grammar correction + general prose",
+            "datasets": ["grammar", "language"],
+            "mixtures": [[0.40, 0.60]],
+            "steps": 800,  # short primer; CoEdIT is small
+        },
+        {
+            "name": "Phase_1_Foundation",
+            "desc": "Language grammar + foundational logic",
+            "datasets": ["language", "logic"],
+            "mixtures": [[0.40, 0.60]],
         },
         {
             "name": "Phase_2_Math_Introduction",
-            "desc": "Interpolating Logic and Math",
-            "datasets": ["logic", "math"],
-            "mixtures": [[0.30, 0.70], [0.50, 0.50]],
+            "desc": "Language, logic and math",
+            "datasets": ["language", "logic", "math"],
+            "mixtures": [[0.20, 0.25, 0.55], [0.20, 0.35, 0.45]],
         },
         {
             "name": "Phase_3_Physics_Application",
-            "desc": "Physics & Derivations",
-            "datasets": ["logic", "math", "physics"],
-            "mixtures": [[0.10, 0.20, 0.70], [0.15, 0.25, 0.60], [0.20, 0.30, 0.50]],
+            "desc": "Language, logic, math and physics",
+            "datasets": ["language", "logic", "math", "physics"],
+            "mixtures": [
+                [0.20, 0.10, 0.15, 0.55],
+                [0.20, 0.10, 0.20, 0.50],
+                [0.20, 0.15, 0.25, 0.40],
+            ],
         },
         {
-            "name": "Phase_4_Philosophy_Meta",
-            "desc": "Philosophy, Conceptual Analysis & general Q&A",
-            "datasets": ["logic", "math", "physics", "philosophy", "qa"],
-            "mixtures": [[0.2, 0.2, 0.2, 0.2, 0.2]],
+            "name": "Phase_4_Integration",
+            "desc": "Language, reasoning, science, philosophy & humanities",
+            "datasets": ["language", "logic", "math", "physics", "philosophy", "humanities"],
+            "mixtures": [[0.20, 0.10, 0.10, 0.15, 0.20, 0.25]],
         },
     ]
 
     total_substeps = sum(len(p["mixtures"]) for p in phases)
-    total_steps = total_substeps * cfg.steps_per_substep // cfg.grad_accum
+    total_microsteps = sum(
+        len(p["mixtures"]) * p.get("steps", cfg.steps_per_substep) for p in phases
+    )
+    total_steps = total_microsteps // cfg.grad_accum
     scheduler = make_scheduler(cfg, optimizer, total_steps)
 
     os.makedirs(cfg.output_dir, exist_ok=True)
     latest = os.path.join(cfg.output_dir, "latest.pt")
     global_step = 0
     completed_substeps = 0
-    if cfg.resume and os.path.exists(latest):
+    if continue_stage:
+        # Continued pretraining: load only the WEIGHTS from the prior run and
+        # train a new stage (new data mix) from scratch — fresh optimizer and
+        # LR schedule, no substep skipping. This is how you add datasets to an
+        # already-trained model without a full restart.
+        if os.path.exists(latest):
+            ckpt = torch.load(latest, map_location=device)
+            model.load_state_dict(ckpt["model"])  # architecture must match
+            print(f"CONTINUE: loaded weights from {latest} (step {ckpt.get('step', '?')}); "
+                  "starting a fresh stage on the current data mix.")
+        else:
+            print(f"CONTINUE requested but no checkpoint at {latest} — training from scratch.")
+    elif cfg.resume and os.path.exists(latest):
         global_step, completed_substeps = load_checkpoint(
             latest, model, optimizer, scheduler, device
         )
@@ -1191,10 +1242,11 @@ def main(resume_override: bool | None = None) -> None:
             )
             streams = [stream]  # single packed stream; batch draws multiple blocks
 
+            phase_steps = phase.get("steps", cfg.steps_per_substep)
             optimizer.zero_grad(set_to_none=True)
             ema = None
             t_log, tok_log = time.time(), tokens_seen  # throughput window
-            for step in range(cfg.steps_per_substep):
+            for step in range(phase_steps):
                 model.train()
                 x, y = get_packed_batch(streams, cfg.batch_size, device)
                 if x is None:
@@ -1238,7 +1290,7 @@ def main(resume_override: bool | None = None) -> None:
                             cfg,
                         )
 
-                if step % cfg.log_every == 0 or step == cfg.steps_per_substep - 1:
+                if step % cfg.log_every == 0 or step == phase_steps - 1:
                     dt = max(1e-6, time.time() - t_log)
                     tps = (tokens_seen - tok_log) / dt  # tokens/sec since last log
                     t_log, tok_log = time.time(), tokens_seen
@@ -1340,5 +1392,11 @@ if __name__ == "__main__":
         main(resume_override=False)
     elif cmd == "resume":
         main(resume_override=True)  # force-resume from latest checkpoint
+    elif cmd in ["continue", "extend"]:
+        # Continued pretraining: keep the trained WEIGHTS, run a new stage on
+        # the current (possibly new) data mix with a fresh schedule. Add
+        # datasets without a restart. Model architecture must match the
+        # checkpoint (same preset).
+        main(continue_stage=True)
     else:
         main()  # default: uses cfg.resume (resume if a checkpoint exists)
