@@ -574,7 +574,11 @@ class Config:
         default_factory=lambda: {
             "grammar": ("grammarly/coedit", None),          # explicit grammar correction
             "language": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
-            "logic": ("reasoning-core/procedural-pretraining-pile", None),
+            # Diverse natural-language reasoning (question + chain-of-thought),
+            # backtranslated from real corpora — NOT procedural templates, so a
+            # small model can't just memorise it (reasoning-core saturated at
+            # ~0.4 eval loss). ~6GB, CC-BY-NC (research use).
+            "logic": ("facebook/natural_reasoning", None),
             "math": ("open-web-math/open-web-math", None),
             "physics": ("millawell/wikipedia_field_of_science", None),
             "philosophy": ("sayhan/strix-philosophy-qa", None),
@@ -612,13 +616,17 @@ def make_formatters():
     match (used to detect provenance after interleave loses it).
     """
 
-    def logic(item):  # reasoning-core: prompt -> (chain-of-thought + answer)
-        p = item.get("prompt", "")
-        if not (isinstance(p, str) and p):
+    def logic(item):  # natural_reasoning: question -> chain-of-thought response
+        q = item.get("question", "")
+        if not (isinstance(q, str) and q):
             return None
-        c, a = item.get("cot", ""), item.get("answer", "")
-        response = "\n".join(s for s in (c, a) if isinstance(s, str) and s)
-        return (True, p, response) if response else None
+        resp = ""
+        r = item.get("responses")
+        if isinstance(r, list) and r and isinstance(r[0], dict):
+            resp = r[0].get("response", "") or ""
+        if not resp:  # fall back to the short reference answer
+            resp = item.get("reference_answer", "") or ""
+        return (True, q, resp) if isinstance(resp, str) and resp else None
 
     def qa_pair(item):  # orca-math / strix: question -> answer
         q, a = item.get("question", ""), item.get("answer", "")
