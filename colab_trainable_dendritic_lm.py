@@ -527,7 +527,8 @@ class Config:
     # Curriculum.
     steps_per_substep: int = 3000  # try 500+ for a trial run (see token math note)
     log_every: int = 100
-    save_every: int = 250  # checkpoint latest.pt every N optimizer steps (crash/resume safety)
+    save_every: int = 100  # write latest.pt locally every N optimizer steps (crash safety)
+    hf_push_every: int = 300  # also PUSH to HF Hub every N steps (mid-phase durability)
 
     # Held-out evaluation: hold out the first eval_docs rows of each dataset
     # (train skips them), pack a few blocks each, and report eval loss at every
@@ -798,6 +799,48 @@ def get_packed_batch(streams, batch_size, device):
     if not xs:
         return None, None
     return torch.cat(xs, 0), torch.cat(ys, 0)
+
+
+class BatchPrefetcher:
+    """Produces batches on a background thread so CPU tokenisation/streaming
+    overlaps GPU compute (the training loop was data-starved, pinned at the
+    tokeniser's rate regardless of model or batch size). Batches are built on
+    the CPU by the worker; the main loop moves them to the GPU (a tiny copy).
+    """
+
+    def __init__(self, streams, batch_size, depth=3):
+        import queue
+        import threading
+
+        self.streams = streams
+        self.batch_size = batch_size
+        self._q = queue.Queue(maxsize=depth)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop:
+            xy = get_packed_batch(self.streams, self.batch_size, "cpu")
+            self._q.put(xy)
+            if xy[0] is None:  # stream exhausted
+                break
+
+    def next(self, device):
+        x, y = self._q.get()
+        if x is None:
+            return None, None
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+    def close(self):
+        import queue
+
+        self._stop = True
+        try:  # unblock the worker if it's waiting on a full queue
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
 
 
 # ==========================================================================
@@ -1313,8 +1356,11 @@ def main(
             "name": "Phase_0_Language_Rules",
             "desc": "Explicit grammar correction + general prose",
             "datasets": ["grammar", "language"],
-            "mixtures": [[0.40, 0.60]],
-            "steps": 800,  # short primer; CoEdIT is small
+            "mixtures": [[0.20, 0.80]],
+            # Short primer. CoEdIT is tiny (~4M tok); at 0.2 weight this keeps it
+            # near ~4 epochs (the data-constrained sweet spot) instead of the
+            # ~20 epochs it was hitting at 0.4 weight x 800 steps x batch 128.
+            "steps": 300,
         },
         {
             "name": "Phase_1_Foundation",
@@ -1429,6 +1475,7 @@ def main(
                 cfg.mask_prompt_loss, cfg.chat_format,
             )
             streams = [stream]  # single packed stream; batch draws multiple blocks
+            prefetcher = BatchPrefetcher(streams, cfg.batch_size)  # overlap data + compute
 
             phase_steps = phase.get("steps", cfg.steps_per_substep)
             optimizer.zero_grad(set_to_none=True)
@@ -1436,7 +1483,7 @@ def main(
             t_log, tok_log = time.time(), tokens_seen  # throughput window
             for step in range(phase_steps):
                 model.train()
-                x, y = get_packed_batch(streams, cfg.batch_size, device)
+                x, y = prefetcher.next(device)
                 if x is None:
                     print("  Stream exhausted early.")
                     break
@@ -1477,6 +1524,17 @@ def main(
                             substep_global,
                             cfg,
                         )
+                    # Mid-phase push to HF so a Colab disconnect during a long
+                    # phase doesn't lose hours (not only at substep boundaries).
+                    if (
+                        cfg.hf_repo
+                        and cfg.hf_push_every
+                        and global_step % cfg.hf_push_every == 0
+                    ):
+                        try:
+                            hf_push_checkpoint(cfg.hf_repo, cfg.output_dir, cfg.preset)
+                        except Exception as exc:
+                            print(f"  HF push failed (non-fatal): {exc}")
 
                 if step % cfg.log_every == 0 or step == phase_steps - 1:
                     dt = max(1e-6, time.time() - t_log)
@@ -1488,6 +1546,8 @@ def main(
                         f"| lr {scheduler.get_last_lr()[0]:.2e} | {tokens_seen / 1e6:.1f}M tok "
                         f"| {tps / 1e3:.1f}K tok/s"
                     )
+
+            prefetcher.close()  # stop the background worker for this substep
 
             # Flush trailing accumulated gradients only if the last
             # accumulation cycle was incomplete (avoids a spurious optimizer
