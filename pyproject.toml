@@ -11,3 +11,13 @@ dependencies = [
     "accelerate>=0.30",
     "jupytext>=1.16",
 ]
+
+[project.optional-dependencies]
+# 8-bit AdamW (bitsandbytes) cuts optimizer-state VRAM ~4x -- see Config.optim_8bit.
+# CUDA + Linux/Windows only, hence optional rather than a hard dependency.
+eightbit = ["bitsandbytes>=0.43"]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

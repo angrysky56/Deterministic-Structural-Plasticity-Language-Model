@@ -33,8 +33,12 @@ The repo is intentionally small and monolithic:
   Don't assume anything described there exists in `colab_trainable_dendritic_lm.py`
   unless you check.
 
-There is no test suite; correctness is checked via the smoke test and
-per-domain held-out eval described below.
+`tests/` (pytest) covers pure-logic pieces — the synthetic planning domain,
+config/preset resolution, data pipeline, checkpoint save/load, and (CUDA-only,
+skipped otherwise) the Triton Vandermonde kernel against its PyTorch
+reference. It's deliberately narrow: no test drives an actual multi-step
+training run, that's still the smoke test's job (below) plus per-domain
+held-out eval.
 
 ## Commands
 
@@ -45,8 +49,14 @@ uv sync                                          # build .venv from pyproject/uv
 uv run python colab_trainable_dendritic_lm.py    # train (default: resume if checkpoint exists)
 ```
 
-Quick self-test — tiny model, learnable synthetic task, **no downloads**, the
-closest thing to a test suite here. Run this after touching model/training code:
+```bash
+uv sync --extra dev && uv run pytest -q   # unit tests (tests/); CUDA ones skip without a GPU
+```
+
+Quick self-test — tiny model, learnable synthetic task, **no downloads**, an
+integration-level check that a full train step actually learns (pytest above
+covers unit-level pieces; this doesn't overlap it). Run after touching
+model/training code:
 
 ```bash
 DSP_SMOKE=1 uv run python colab_trainable_dendritic_lm.py
@@ -56,7 +66,7 @@ Model size and run mode are CLI words, order-independent, parsed in
 `if __name__ == "__main__"` at the bottom of the script:
 
 ```bash
-uv run python colab_trainable_dendritic_lm.py                    # default (110m, resume-if-exists)
+uv run python colab_trainable_dendritic_lm.py                    # default (500m, resume-if-exists)
 uv run python colab_trainable_dendritic_lm.py 42m                # tiny preset, fastest smoke/iteration
 uv run python colab_trainable_dendritic_lm.py overwrite 110m     # fresh run, ignore checkpoint
 uv run python colab_trainable_dendritic_lm.py 1b continue        # continued pretraining (new stage, same weights)
@@ -66,11 +76,13 @@ uv run python colab_trainable_dendritic_lm.py push               # manual HF Hub
 uv run python colab_trainable_dendritic_lm.py pull
 ```
 
-Presets: `42m`, `110m` (default), `500m`, `1b` — set via `Config.preset` or the
+Presets: `42m`, `110m`, `500m` (default), `1b` — set via `Config.preset` or the
 CLI word above; each fixes `d_model`/`depth`/`branch_dim` and a matched
 `batch_size`/`grad_accum`/`lr` (see `MODEL_PRESETS`, effective batch ~96,
-tuned for an 80GB A100). `main()` auto-scales `batch_size`/`grad_accum` down on
-smaller GPUs (<70GB) to keep the effective batch constant.
+tuned for an 80GB A100 — this is the intended training target; the default
+preset is deliberately too large for local iteration on a small card, use
+`42m`/`110m` explicitly for that). `main()` auto-scales `batch_size`/
+`grad_accum` down on smaller GPUs (<70GB) to keep the effective batch constant.
 
 Inference / chat, from a checkpoint (recurrent-capable, unbounded context):
 
@@ -100,6 +112,22 @@ or `ruff check .` / `black .` / `isort .` directly.
   autocast it away. A true `O(1)`-per-token recurrent inference mode is
   *planned* (`docs/recurrent_inference.md`) but not yet implemented — today's
   `chat.py` generation reprocesses the whole prefix every step via the FFT path.
+- **`ResonatorSSMKernel.forward`'s pole→kernel construction is a custom
+  Triton op** (`_VandermondeKernelFn`, guarded by `_HAS_TRITON`, CUDA only —
+  falls back to the equivalent naive PyTorch einsum on CPU or if Triton is
+  unavailable). It fuses what was a `(d_model, n_states/2, seq_len)` complex
+  Vandermonde tensor + einsum reduction into one kernel that never
+  materialises that tensor, both because it was ~35% of the whole model's
+  forward time (recomputed again under `use_checkpoint=True`'s backward) and
+  because that tensor being complex-valued is what caused `torch.compile`
+  to blow up VRAM (Triton has no native complex dtype, so Inductor falls back
+  to an eager kernel for it, breaking fusion). If you touch the pole
+  parameterisation (`log_A_real`/`A_imag`/`log_dt`/`C`) in
+  `ResonatorSSMKernel._discretise`, the custom kernel's forward+backward math
+  must be re-derived to match — it is NOT auto-differentiated, it hand-codes
+  the gradient w.r.t. the four `(H, N/2)` tensors it consumes
+  (`dt_A.real`/`.imag`, `c_mod.real`/`.imag`); everything upstream of those
+  (the discretisation itself) still uses ordinary autograd.
 - **`DendriticMLP`** fans a token into `num_branches` independent GLU branches
   (`d_ff = num_branches * branch_dim`), each with a steep asymmetric "soma"
   gate that suppresses branches that haven't "resolved" before a

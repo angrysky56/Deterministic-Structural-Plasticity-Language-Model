@@ -34,6 +34,7 @@ without the finite window of a plain convolution.
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import random
@@ -49,6 +50,163 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.checkpoint import checkpoint
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = torch.cuda.is_available()
+except ImportError:
+    _HAS_TRITON = False
+
+# ==========================================================================
+# 0. TRITON KERNEL  --  fused SSM-kernel Vandermonde construction
+# ==========================================================================
+#
+# ResonatorSSMKernel.forward built its (d_model, length) convolution kernel by
+# materialising a (d_model, n_states/2, length) complex Vandermonde tensor
+# (`exp(dt_a * arange(length))`) and immediately contracting it away with an
+# einsum. Profiled on the 110m preset (d_model=768, n_states=64, seq_len=2048)
+# that ~400MB throwaway tensor was ~45% of ResonatorSSMKernel's own time and
+# ~35% of the WHOLE model's forward pass -- and with use_checkpoint=True
+# (the default) it's recomputed again in the backward pass, so ~35% of
+# forward compute is paid twice per step. It also happens to be complex
+# valued, and TorchInductor cannot generate Triton code for complex ops (the
+# Triton language itself has no complex dtype) -- not a version/config
+# limitation, a structural one -- so this tensor is exactly what poisoned
+# torch.compile's memory footprint (see Config.torch_compile below).
+#
+# The fix: never materialise the (H, N, L) tensor at all. Since
+# a_bar = exp(dt_a) with dt_a = neg_alpha + i*theta (both already real
+# tensors from ResonatorSSMKernel._discretise, no polar<->cartesian
+# conversion needed), the kernel value is
+#     kernel[h, l] = 2 * sum_n exp(neg_alpha[h,n]*l) *
+#                        (cm_real[h,n]*cos(theta[h,n]*l) - cm_imag[h,n]*sin(theta[h,n]*l))
+# which is a pure real-valued reduction over the small n_states/2 axis (32 by
+# default) -- Triton has no trouble with exp/cos/sin, only with a native
+# complex dtype. The forward kernel below computes and reduces this per
+# (channel, position) block without ever writing the (H, N, L) intermediate
+# to global memory (FlashAttention-style); the backward kernel recomputes the
+# same decay/cos/sin terms on the fly (never storing them either) and reduces
+# over the sequence axis to get gradients w.r.t. neg_alpha/theta/cm_real/
+# cm_imag. Ordinary PyTorch autograd handles everything before/after this op
+# (the cheap (H, N)-sized pole discretisation), so no manual gradient for
+# log_A_real/A_imag/log_dt/C is needed -- only for the 4 tensors this op
+# actually touches.
+if _HAS_TRITON:
+
+    @triton.jit
+    def _vandermonde_fwd_kernel(
+        neg_alpha_ptr, theta_ptr, cm_real_ptr, cm_imag_ptr, out_ptr,
+        N, L,
+        BLOCK_L: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        pid_h = tl.program_id(0)
+        pid_l = tl.program_id(1)
+
+        n_off = tl.arange(0, BLOCK_N)
+        n_mask = n_off < N
+        base_hn = pid_h * N + n_off
+        neg_alpha = tl.load(neg_alpha_ptr + base_hn, mask=n_mask, other=0.0)
+        theta = tl.load(theta_ptr + base_hn, mask=n_mask, other=0.0)
+        cm_real = tl.load(cm_real_ptr + base_hn, mask=n_mask, other=0.0)
+        cm_imag = tl.load(cm_imag_ptr + base_hn, mask=n_mask, other=0.0)
+
+        l_off = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+        l_mask = l_off < L
+        pos = l_off.to(tl.float32)
+
+        decay = tl.exp(neg_alpha[None, :] * pos[:, None])     # (BLOCK_L, BLOCK_N)
+        ang = theta[None, :] * pos[:, None]
+        term = decay * (cm_real[None, :] * tl.cos(ang) - cm_imag[None, :] * tl.sin(ang))
+        term = tl.where(n_mask[None, :], term, 0.0)
+        kernel_val = 2.0 * tl.sum(term, axis=1)
+
+        tl.store(out_ptr + pid_h * L + l_off, kernel_val, mask=l_mask)
+
+    @triton.jit
+    def _vandermonde_bwd_kernel(
+        grad_out_ptr, neg_alpha_ptr, theta_ptr, cm_real_ptr, cm_imag_ptr,
+        d_neg_alpha_ptr, d_theta_ptr, d_cm_real_ptr, d_cm_imag_ptr,
+        N, L,
+        BLOCK_L: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        pid_h = tl.program_id(0)
+        n_off = tl.arange(0, BLOCK_N)
+        n_mask = n_off < N
+        base_hn = pid_h * N + n_off
+        neg_alpha = tl.load(neg_alpha_ptr + base_hn, mask=n_mask, other=0.0)
+        theta = tl.load(theta_ptr + base_hn, mask=n_mask, other=0.0)
+        cm_real = tl.load(cm_real_ptr + base_hn, mask=n_mask, other=0.0)
+        cm_imag = tl.load(cm_imag_ptr + base_hn, mask=n_mask, other=0.0)
+
+        acc_cm_real = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc_cm_imag = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc_neg_alpha = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc_theta = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        for l_start in range(0, L, BLOCK_L):
+            l_off = l_start + tl.arange(0, BLOCK_L)
+            l_mask = l_off < L
+            pos = l_off.to(tl.float32)
+            g = tl.load(grad_out_ptr + pid_h * L + l_off, mask=l_mask, other=0.0)
+            g2 = tl.where(l_mask, 2.0 * g, 0.0)[:, None]  # (BLOCK_L, 1)
+
+            decay = tl.exp(neg_alpha[None, :] * pos[:, None])  # (BLOCK_L, BLOCK_N)
+            ang = theta[None, :] * pos[:, None]
+            cos_a = tl.cos(ang)
+            sin_a = tl.sin(ang)
+            term = cm_real[None, :] * cos_a - cm_imag[None, :] * sin_a
+
+            acc_cm_real += tl.sum(g2 * decay * cos_a, axis=0)
+            acc_cm_imag += tl.sum(-g2 * decay * sin_a, axis=0)
+            acc_neg_alpha += tl.sum(g2 * pos[:, None] * decay * term, axis=0)
+            acc_theta += tl.sum(
+                g2 * decay * pos[:, None] * (-cm_real[None, :] * sin_a - cm_imag[None, :] * cos_a), axis=0
+            )
+
+        tl.store(d_cm_real_ptr + base_hn, acc_cm_real, mask=n_mask)
+        tl.store(d_cm_imag_ptr + base_hn, acc_cm_imag, mask=n_mask)
+        tl.store(d_neg_alpha_ptr + base_hn, acc_neg_alpha, mask=n_mask)
+        tl.store(d_theta_ptr + base_hn, acc_theta, mask=n_mask)
+
+    class _VandermondeKernelFn(torch.autograd.Function):
+        """kernel[h,l] = 2*sum_n exp(neg_alpha[h,n]*l) *
+        (cm_real[h,n]*cos(theta[h,n]*l) - cm_imag[h,n]*sin(theta[h,n]*l)),
+        fused forward+backward, (H, N, L) never materialised."""
+
+        @staticmethod
+        def forward(ctx, neg_alpha, theta, cm_real, cm_imag, length):
+            h, n = neg_alpha.shape
+            block_n = triton.next_power_of_2(max(n, 1))
+            block_l = 256
+            out = torch.empty((h, length), device=neg_alpha.device, dtype=torch.float32)
+            grid = (h, triton.cdiv(length, block_l))
+            _vandermonde_fwd_kernel[grid](
+                neg_alpha, theta, cm_real, cm_imag, out,
+                n, length, BLOCK_L=block_l, BLOCK_N=block_n,
+            )
+            ctx.save_for_backward(neg_alpha, theta, cm_real, cm_imag)
+            ctx.length, ctx.block_n, ctx.block_l = length, block_n, block_l
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            neg_alpha, theta, cm_real, cm_imag = ctx.saved_tensors
+            h, n = neg_alpha.shape
+            grad_out = grad_out.contiguous()
+            d_neg_alpha = torch.empty_like(neg_alpha)
+            d_theta = torch.empty_like(theta)
+            d_cm_real = torch.empty_like(cm_real)
+            d_cm_imag = torch.empty_like(cm_imag)
+            grid = (h,)
+            _vandermonde_bwd_kernel[grid](
+                grad_out, neg_alpha, theta, cm_real, cm_imag,
+                d_neg_alpha, d_theta, d_cm_real, d_cm_imag,
+                n, ctx.length, BLOCK_L=ctx.block_l, BLOCK_N=ctx.block_n,
+            )
+            return d_neg_alpha, d_theta, d_cm_real, d_cm_imag, None
+
 
 # ==========================================================================
 # 1. TEMPORAL MIXER  --  Diagonal damped-resonator SSM (S4D-style)
@@ -98,10 +256,14 @@ class ResonatorSSMKernel(nn.Module):
     def _discretise(self):
         """Shared discretisation used by both convolutional and recurrent paths.
 
-        Returns ``(A_bar, B_bar, C)`` where:
+        Returns ``(A_bar, B_bar, C, dt_A)`` where:
         - ``A_bar = exp(dt * A)`` — discrete pole (damped complex), (H, N/2)
         - ``B_bar = (A_bar - 1) / A`` — ZOH-discretised input matrix, (H, N/2)
         - ``C`` — readout weights (unmodified), (H, N/2)
+        - ``dt_A = dt * A`` — log-domain discrete pole (H, N/2); returned so
+          callers needing it (the Vandermonde kernel construction) don't have
+          to recover it via ``log(A_bar)``, a redundant exp/log round-trip
+          that also risks a branch-cut wraparound on the imaginary part.
         """
         dt = torch.exp(self.log_dt)  # (H,)
         c = torch.view_as_complex(self.C)  # (H, N/2)
@@ -109,19 +271,27 @@ class ResonatorSSMKernel(nn.Module):
         dt_a = a * dt.unsqueeze(-1)  # (H, N/2)
         a_bar = torch.exp(dt_a)  # (H, N/2)
         b_bar = (a_bar - 1.0) / a  # (H, N/2)
-        return a_bar, b_bar, c
+        return a_bar, b_bar, c, dt_a
 
     def forward(self, length: int) -> torch.Tensor:
         """Return the real causal kernel of shape ``(d_model, length)``."""
         # Kernel math runs in float32 (complex ops are unsupported in bf16).
-        a_bar, b_bar, c = self._discretise()
+        a_bar, b_bar, c, dt_a = self._discretise()
         c_mod = c * b_bar  # fold B into C for the convolutional form
 
-        # Vandermonde: powers of the discrete pole along the sequence axis.
-        dt_a = torch.log(a_bar)  # recover dt*A for exponentiation
-        arange = torch.arange(length, device=a_bar.device)
-        powers = torch.exp(dt_a.unsqueeze(-1) * arange)  # (H, N/2, L)
-        kernel = 2.0 * torch.einsum("hn,hnl->hl", c_mod, powers).real  # (H, L)
+        if _HAS_TRITON and dt_a.is_cuda:
+            # Fused Triton path: builds + reduces the Vandermonde sum without
+            # ever materialising the (H, N/2, L) tensor. See the module
+            # comment above _vandermonde_fwd_kernel.
+            kernel = _VandermondeKernelFn.apply(
+                dt_a.real.contiguous(), dt_a.imag.contiguous(),
+                c_mod.real.contiguous(), c_mod.imag.contiguous(), length,
+            )
+        else:
+            # CPU / no-triton fallback: identical math, naive materialisation.
+            arange = torch.arange(length, device=a_bar.device)
+            powers = torch.exp(dt_a.unsqueeze(-1) * arange)  # (H, N/2, L)
+            kernel = 2.0 * torch.einsum("hn,hnl->hl", c_mod, powers).real  # (H, L)
         return kernel
 
     def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -143,7 +313,7 @@ class ResonatorSSMKernel(nn.Module):
             ``(y_t, h_new)`` where ``y_t`` is ``(B, H)`` real and ``h_new``
             has the same shape as ``h``.
         """
-        a_bar, b_bar, c = self._discretise()  # (H, N/2) each
+        a_bar, b_bar, c, _ = self._discretise()  # (H, N/2) each
         # State update: h_new = A_bar * h + B_bar * x_t
         h_new = a_bar * h + b_bar * x_t.to(torch.cfloat).unsqueeze(-1)
         # Readout: y_t = 2 * Re(C · h_new)  (conjugate-pair reconstruction)
@@ -492,8 +662,12 @@ MODEL_PRESETS = {
 
 @dataclass
 class Config:
-    # Pick model scale here; override any field below to customise.
-    preset: str = "110m"
+    # Pick model scale here; override any field below to customise. Targets
+    # an A100 (Colab) by default, per the "500m RECOMMENDED... (DEFAULT)"
+    # comment above -- local iteration on a smaller card should pass an
+    # explicit preset (e.g. `Config(preset="42m")`) rather than relying on
+    # this default.
+    preset: str = "500m"
 
     # Architecture — left None to inherit from the preset.
     d_model: int | None = None
@@ -502,6 +676,27 @@ class Config:
     n_states: int = 64  # SSM states per channel (N/2 conjugate pole pairs)
     num_branches: int = 8  # dendritic branches per token
     use_checkpoint: bool = True
+    # 8-bit AdamW (bitsandbytes): quantizes the momentum/variance buffers to
+    # ~1 byte/param instead of fp32's 8, cutting optimizer VRAM ~4x (e.g. ~12GB
+    # -> ~3GB at the 1b preset). GPU-resident, no host transfer, so unlike CPU
+    # offload it doesn't touch the training loop -- just the optimizer ctor.
+    # Needs `pip install bitsandbytes` (Colab) or `uv sync --extra eightbit`
+    # (local); falls back to plain AdamW with a warning if unavailable. Off by
+    # default since it changes optimizer numerics and only 500m/1b need it.
+    optim_8bit: bool = False
+    # torch.compile() the model. Originally measured ~2.4x peak VRAM for only
+    # ~3% speedup (110m, seq_len 2048, checkpointing on) on a local RTX 3060,
+    # because Inductor can't codegen the complex rfft/irfft SSM kernel (Triton
+    # has no complex dtype) and fell back to an unfused eager kernel *inside*
+    # the compiled graph -- the ~400MB Vandermonde tensor that fallback was
+    # choking on is now built by the custom Triton op in
+    # ResonatorSSMKernel.forward instead (opaque to dynamo, so it's no longer
+    # traced at all), which resolved the memory blowup: post-fix, compiling
+    # the 500m preset costs no extra VRAM and gives a further ~3% on top of
+    # the Triton kernel's own gain (measured on the 3060, which also can't
+    # use Inductor's max-autotune-gemm mode for lack of SMs -- likely a
+    # larger win on an A100). On by default now that it's memory-neutral.
+    torch_compile: bool = True
 
     # Data / optimisation (batch_size/grad_accum/lr inherit from the preset if None).
     seq_len: int = 2048  # SSM gives real long context (was 256)
@@ -663,6 +858,9 @@ def make_formatters():
 
     # language/math/physics are large prose corpora; philosophy is Q&A.
     # qa_pair/alpaca are kept defined for a future SFT pass (orca-math, alpaca).
+    # planning rows are already fully-rendered CoT text (see
+    # BlocksworldPlanningStream below), so the plain prose formatter applies
+    # unchanged.
     return {
         "grammar": coedit,
         "language": prose,
@@ -671,8 +869,236 @@ def make_formatters():
         "physics": prose,
         "philosophy": qa_pair,
         "humanities": prose,
+        "planning": prose,
         "qa": alpaca,
     }
+
+
+# --------------------------------------------------------------------------
+# Synthetic symbolic-planning domain: PDDL-Instruct-style chain-of-thought
+# (Verma et al., "Teaching LLMs to Plan", arXiv:2509.13351). The paper
+# fine-tunes an already-capable LLM with an external VAL verifier in the
+# training loop, feeding back precondition/effect violations over several
+# iterations -- that machinery needs a model that can already produce
+# coherent multi-step text and a verifier binary, neither of which fits a
+# from-scratch base-pretraining curriculum. What DOES transfer is the paper's
+# core insight and its training DATA shape: verbose, explicit
+# precondition-check / effect-application / state-tracking chain-of-thought
+# over STRIPS-style planning problems, mixed with deliberately invalid plans
+# that state exactly which precondition was violated (Phase 1 of the paper).
+# That data is entirely procedurally generatable and self-verifying -- the
+# same STRIPS engine that generates a problem also IS the ground-truth
+# checker, so this needs no external VAL binary, no LLM feedback loop, and no
+# download; like math/physics it "never runs out". It teaches the model
+# exact multi-step state tracking, a skill that sits naturally between the
+# 'logic' and 'math' curriculum domains.
+def _bw_random_towers(rng, blocks):
+    """Partition blocks into random stacks (bottom, ..., top) of size <= 3."""
+    order = blocks[:]
+    rng.shuffle(order)
+    towers, i = [], 0
+    while i < len(order):
+        k = rng.randint(1, min(3, len(order) - i))
+        towers.append(order[i:i + k])
+        i += k
+    return towers
+
+
+def _bw_state_from_towers(towers):
+    on, ontable, clear = {}, set(), set()
+    for tower in towers:
+        ontable.add(tower[0])
+        for i in range(1, len(tower)):
+            on[tower[i]] = tower[i - 1]
+        clear.add(tower[-1])
+    return {"on": on, "ontable": ontable, "clear": clear, "holding": None}
+
+
+def _bw_state_preds(state):
+    preds = [f"(ontable {b})" for b in sorted(state["ontable"])]
+    preds += [f"(on {b} {base})" for b, base in sorted(state["on"].items())]
+    preds += [f"(clear {b})" for b in sorted(state["clear"])]
+    preds.append(f"(holding {state['holding']})" if state["holding"] else "(handempty)")
+    return preds
+
+
+def _bw_action_str(action):
+    return "(" + " ".join(action) + ")"
+
+
+def _bw_action_spec(state, action):
+    """Preconditions (name, holds-in-state) plus the add/delete effect lists
+    the action would apply IF every precondition holds -- standard STRIPS
+    4-operator Blocksworld (pick-up, put-down, stack, unstack), same
+    predicate set the paper uses.
+    """
+    kind = action[0]
+    on, ontable, clear, holding = state["on"], state["ontable"], state["clear"], state["holding"]
+    if kind == "pick-up":
+        (x,) = action[1:]
+        preconds = [(f"(clear {x})", x in clear), (f"(ontable {x})", x in ontable),
+                    ("(handempty)", holding is None)]
+        add, del_ = [f"(holding {x})"], [f"(ontable {x})", f"(clear {x})", "(handempty)"]
+    elif kind == "put-down":
+        (x,) = action[1:]
+        preconds = [(f"(holding {x})", holding == x)]
+        add, del_ = [f"(ontable {x})", f"(clear {x})", "(handempty)"], [f"(holding {x})"]
+    elif kind == "stack":
+        x, y = action[1:]
+        preconds = [(f"(holding {x})", holding == x), (f"(clear {y})", y in clear)]
+        add, del_ = [f"(on {x} {y})", f"(clear {x})", "(handempty)"], [f"(holding {x})", f"(clear {y})"]
+    elif kind == "unstack":
+        x, y = action[1:]
+        preconds = [(f"(on {x} {y})", on.get(x) == y), (f"(clear {x})", x in clear),
+                    ("(handempty)", holding is None)]
+        add, del_ = [f"(holding {x})", f"(clear {y})"], [f"(on {x} {y})", f"(clear {x})", "(handempty)"]
+    else:
+        raise ValueError(kind)
+    return preconds, add, del_
+
+
+def _bw_apply(state, action):
+    """Apply an already-checked-applicable action; returns the new state."""
+    kind = action[0]
+    on, ontable, clear = dict(state["on"]), set(state["ontable"]), set(state["clear"])
+    holding = state["holding"]
+    if kind == "pick-up":
+        (x,) = action[1:]
+        ontable.discard(x)
+        clear.discard(x)
+        holding = x
+    elif kind == "put-down":
+        (x,) = action[1:]
+        ontable.add(x)
+        clear.add(x)
+        holding = None
+    elif kind == "stack":
+        x, y = action[1:]
+        on[x] = y
+        clear.discard(y)
+        clear.add(x)
+        holding = None
+    elif kind == "unstack":
+        x, y = action[1:]
+        del on[x]
+        clear.discard(x)
+        clear.add(y)
+        holding = x
+    return {"on": on, "ontable": ontable, "clear": clear, "holding": holding}
+
+
+def _bw_solve(init_towers, goal_towers):
+    """Disassemble every initial tower onto the table, then rebuild each goal
+    tower bottom-up. Always correct by construction (not necessarily
+    optimal -- the paper targets satisficing plans too, see Sec. 5.1)."""
+    plan = []
+    for tower in init_towers:
+        for idx in range(len(tower) - 1, 0, -1):
+            plan.append(("unstack", tower[idx], tower[idx - 1]))
+            plan.append(("put-down", tower[idx]))
+    for tower in goal_towers:
+        for idx in range(1, len(tower)):
+            plan.append(("pick-up", tower[idx]))
+            plan.append(("stack", tower[idx], tower[idx - 1]))
+    return plan
+
+
+def _bw_goal_preds(goal_towers):
+    return [f"(on {tower[idx]} {tower[idx - 1]})" for tower in goal_towers for idx in range(1, len(tower))]
+
+
+def _bw_render_example(rng, n_blocks, invalid_frac=0.2):
+    """One PDDL-Instruct-style CoT training example: header + step-by-step
+    precondition/effect/state trace, ending either in a goal-achieved VALID
+    plan or (invalid_frac of the time) a deliberately-omitted setup action
+    whose paired follow-up then provably violates a precondition.
+    """
+    blocks = [chr(ord("a") + i) for i in range(n_blocks)]
+    init_towers = _bw_random_towers(rng, blocks)
+    goal_towers = _bw_random_towers(rng, blocks)
+    plan = _bw_solve(init_towers, goal_towers)
+    goal_preds = _bw_goal_preds(goal_towers)
+
+    # Omitting a pick-up/unstack guarantees its paired stack/put-down fails
+    # (holding x) next -- a clean, always-valid way to manufacture a plan
+    # that is invalid for a known, checkable reason.
+    skip_candidates = [i for i, a in enumerate(plan[:-1]) if a[0] in ("pick-up", "unstack")]
+    skip_idx = rng.choice(skip_candidates) if skip_candidates and rng.random() < invalid_frac else None
+
+    state = _bw_state_from_towers(init_towers)
+    lines = [
+        "[BLOCKSWORLD PLANNING PROBLEM]",
+        f"Objects: {' '.join(blocks)}",
+        f"Initial state: {', '.join(_bw_state_preds(state))}",
+        f"Goal: {', '.join(goal_preds)}",
+        "",
+        "[STEP BY STEP PLANNING]",
+    ]
+
+    step = 0
+    for i, action in enumerate(plan):
+        if i == skip_idx:
+            continue  # deliberately omitted from the executed trace
+        step += 1
+        preconds, add, del_ = _bw_action_spec(state, action)
+        applicable = all(ok for _, ok in preconds)
+        lines.append(f"\n[Step {step}: State s{step - 1}  Action a{step}  State s{step}]")
+        lines.append(f"- Current state s{step - 1}: {', '.join(_bw_state_preds(state))}")
+        lines.append(f"- Proposed action a{step}: {_bw_action_str(action)}")
+        lines.append("- Precondition check:")
+        for name, ok in preconds:
+            lines.append(f"  - {name}: {'TRUE' if ok else 'FALSE'} in s{step - 1}")
+        if not applicable:
+            failed = next(name for name, ok in preconds if not ok)
+            lines.append(f"- VIOLATION: The precondition {failed} is not satisfied")
+            lines.append("- Action is NOT APPLICABLE")
+            lines.append(
+                f"\n[PLAN VALIDITY] This plan is INVALID. Action {_bw_action_str(action)} at "
+                f"step {step} cannot be applied because {failed} does not hold in s{step - 1}."
+            )
+            return "\n".join(lines)
+        lines.append("- Action is APPLICABLE")
+        state = _bw_apply(state, action)
+        lines.append(f"- Effect application:\n  - Add: {', '.join(add)}\n  - Delete: {', '.join(del_)}")
+        lines.append(f"- Resulting state s{step}: {', '.join(_bw_state_preds(state))}")
+
+    # No forced violation was hit -> the full plan ran; confirm the goal.
+    cur_preds = set(_bw_state_preds(state))
+    achieved = all(g in cur_preds for g in goal_preds)
+    assert achieved, "solver-generated plan did not reach its own goal"  # self-verified, should never fire
+    lines.append("\n[GOAL ACHIEVEMENT CHECK]")
+    lines.append(f"Required: {', '.join(goal_preds)}")
+    for g in goal_preds:
+        lines.append(f"- {g}: TRUE in s{step}")
+    lines.append("Goal is ACHIEVED.")
+    executed = [a for i, a in enumerate(plan) if i != skip_idx]
+    lines.append("\n[PLAN VALIDITY] This plan is VALID.")
+    lines.append(f"[FINAL PLAN] {', '.join(_bw_action_str(a) for a in executed)}")
+    return "\n".join(lines)
+
+
+class BlocksworldPlanningStream:
+    """Infinite synthetic Blocksworld symbolic-planning CoT stream.
+
+    Each call advances a persistent RNG (``__iter__`` returns ``self``, so
+    repeated ``iter()`` calls from WeightedMultiplex continue rather than
+    replaying the same sequence) and yields ``{"text": ...}`` rows already
+    formatted for the plain-prose formatter. See the module comment above
+    ``_bw_random_towers`` for the rationale.
+    """
+
+    def __init__(self, seed=1, min_blocks=3, max_blocks=6, invalid_frac=0.2):
+        self.rng = random.Random(seed)
+        self.min_blocks = min_blocks
+        self.max_blocks = max_blocks
+        self.invalid_frac = invalid_frac
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        n = self.rng.randint(self.min_blocks, self.max_blocks)
+        return {"text": _bw_render_example(self.rng, n, self.invalid_frac)}
 
 
 def encode_example(name, item, formatters, tokenizer, mask_prompt, chat_format):
@@ -857,9 +1283,14 @@ class BatchPrefetcher:
 
 
 def save_checkpoint(path, model, optimizer, scheduler, step, completed_substeps, cfg):
+    # torch.compile() wraps the module and prefixes state_dict keys with
+    # "_orig_mod." -- always save/load the plain (uncompiled) module's keys so
+    # checkpoints stay compatible with chat.py and with toggling
+    # cfg.torch_compile across resumes.
+    raw_model = getattr(model, "_orig_mod", model)
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "step": step,
@@ -872,7 +1303,7 @@ def save_checkpoint(path, model, optimizer, scheduler, step, completed_substeps,
 
 def load_checkpoint(path, model, optimizer, scheduler, device):
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    getattr(model, "_orig_mod", model).load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     return ckpt.get("step", 0), ckpt.get("completed_substeps", 0)
@@ -905,14 +1336,28 @@ def build_model_and_optim(cfg: Config, vocab_size: int, device: str):
             no_decay.append(p)
         else:
             decay.append(p)
-    optimizer = optim.AdamW(
-        [
-            {"params": decay, "weight_decay": cfg.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ],
-        lr=cfg.lr,
-        betas=(0.9, 0.95),
-    )
+    param_groups = [
+        {"params": decay, "weight_decay": cfg.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    optimizer = None
+    if cfg.optim_8bit and device == "cuda":
+        try:
+            import bitsandbytes as bnb
+
+            optimizer = bnb.optim.AdamW8bit(param_groups, lr=cfg.lr, betas=(0.9, 0.95))
+            # Embedding (tied to lm_head) is unusually quantization-sensitive;
+            # bitsandbytes' own docs recommend keeping its optimizer state in
+            # fp32 rather than 8-bit.
+            bnb.optim.GlobalOptimManager.get_instance().register_module_override(
+                model.embedding, "weight", {"optim_bits": 32}
+            )
+            print("Optimizer: bitsandbytes AdamW8bit (quantized optimizer state)")
+        except ImportError:
+            print("optim_8bit=True but bitsandbytes is not installed "
+                  "(pip install bitsandbytes) -- falling back to plain AdamW.")
+    if optimizer is None:
+        optimizer = optim.AdamW(param_groups, lr=cfg.lr, betas=(0.9, 0.95))
     return model, optimizer
 
 
@@ -1345,6 +1790,17 @@ def main(
         except Exception as exc:  # gated / offline / renamed
             print(f"  SKIP  {name:<10} <- {repo}  ({type(exc).__name__}: {exc})")
 
+    # Synthetic symbolic-planning domain (PDDL-Instruct-style CoT, see the
+    # comment above BlocksworldPlanningStream): procedurally generated and
+    # self-verified by its own STRIPS engine, so it needs no download and
+    # never runs out. Eval uses a disjoint seed so held-out problems aren't
+    # drawn from the same RNG sequence as training.
+    loaded["planning"] = BlocksworldPlanningStream(seed=1)
+    eval_loaded["planning"] = list(
+        itertools.islice(BlocksworldPlanningStream(seed=999_983), cfg.eval_docs)
+    )
+    print("  loaded planning   <- synthetic Blocksworld STRIPS CoT (procedural)")
+
     print("Building held-out eval blocks...")
     eval_blocks_by_name = build_eval_blocks(
         eval_loaded, formatters, tokenizer, cfg.seq_len, cfg.eval_blocks_per,
@@ -1372,24 +1828,27 @@ def main(
         },
         {
             "name": "Phase_1_Foundation",
-            "desc": "Language grammar + foundational logic",
-            "datasets": ["language", "logic"],
-            "mixtures": [[0.40, 0.60]],
+            "desc": "Language grammar + foundational logic + symbolic planning",
+            # 'planning' (synthetic Blocksworld CoT, see BlocksworldPlanningStream)
+            # sits alongside 'logic' as another formal, exactly-checkable
+            # reasoning source -- see the PDDL-Instruct discussion above.
+            "datasets": ["language", "logic", "planning"],
+            "mixtures": [[0.35, 0.50, 0.15]],
         },
         {
             "name": "Phase_2_Math_Introduction",
-            "desc": "Language, logic and math",
-            "datasets": ["language", "logic", "math"],
-            "mixtures": [[0.20, 0.25, 0.55], [0.20, 0.35, 0.45]],
+            "desc": "Language, logic, symbolic planning and math",
+            "datasets": ["language", "logic", "math", "planning"],
+            "mixtures": [[0.20, 0.20, 0.45, 0.15], [0.20, 0.30, 0.35, 0.15]],
         },
         {
             "name": "Phase_3_Physics_Application",
-            "desc": "Language, logic, math and physics",
-            "datasets": ["language", "logic", "math", "physics"],
+            "desc": "Language, logic, math, symbolic planning and physics",
+            "datasets": ["language", "logic", "math", "physics", "planning"],
             "mixtures": [
-                [0.20, 0.10, 0.15, 0.55],
-                [0.20, 0.10, 0.20, 0.50],
-                [0.20, 0.15, 0.25, 0.40],
+                [0.20, 0.10, 0.15, 0.45, 0.10],
+                [0.20, 0.10, 0.20, 0.40, 0.10],
+                [0.20, 0.15, 0.25, 0.30, 0.10],
             ],
         },
         {
@@ -1418,7 +1877,7 @@ def main(
         # already-trained model without a full restart.
         if os.path.exists(latest):
             ckpt = torch.load(latest, map_location=device)
-            model.load_state_dict(ckpt["model"])  # architecture must match
+            getattr(model, "_orig_mod", model).load_state_dict(ckpt["model"])  # architecture must match
             print(f"CONTINUE: loaded weights from {latest} (step {ckpt.get('step', '?')}); "
                   "starting a fresh stage on the current data mix.")
         else:
@@ -1430,6 +1889,14 @@ def main(
         print(
             f"Resumed from {latest}: step {global_step}, {completed_substeps} substeps done"
         )
+
+    if cfg.torch_compile and device == "cuda":
+        # fit_batch_size() above tuned batch_size/grad_accum in eager mode;
+        # with the Vandermonde kernel construction now behind an opaque
+        # Triton op (see Config.torch_compile), compiling no longer inflates
+        # peak VRAM measurably, so no extra safety margin is applied here.
+        print("Compiling model with torch.compile() (cfg.torch_compile=True)...")
+        model = torch.compile(model)
 
     print("\nStarting curriculum training...")
     substep_global = 0  # flat index across all phases, for resume skip-ahead
