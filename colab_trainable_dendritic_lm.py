@@ -97,9 +97,15 @@ if _HAS_TRITON:
 
     @triton.jit
     def _vandermonde_fwd_kernel(
-        neg_alpha_ptr, theta_ptr, cm_real_ptr, cm_imag_ptr, out_ptr,
-        N, L,
-        BLOCK_L: tl.constexpr, BLOCK_N: tl.constexpr,
+        neg_alpha_ptr,
+        theta_ptr,
+        cm_real_ptr,
+        cm_imag_ptr,
+        out_ptr,
+        N,
+        L,
+        BLOCK_L: tl.constexpr,
+        BLOCK_N: tl.constexpr,
     ):
         pid_h = tl.program_id(0)
         pid_l = tl.program_id(1)
@@ -116,7 +122,7 @@ if _HAS_TRITON:
         l_mask = l_off < L
         pos = l_off.to(tl.float32)
 
-        decay = tl.exp(neg_alpha[None, :] * pos[:, None])     # (BLOCK_L, BLOCK_N)
+        decay = tl.exp(neg_alpha[None, :] * pos[:, None])  # (BLOCK_L, BLOCK_N)
         ang = theta[None, :] * pos[:, None]
         term = decay * (cm_real[None, :] * tl.cos(ang) - cm_imag[None, :] * tl.sin(ang))
         term = tl.where(n_mask[None, :], term, 0.0)
@@ -126,10 +132,19 @@ if _HAS_TRITON:
 
     @triton.jit
     def _vandermonde_bwd_kernel(
-        grad_out_ptr, neg_alpha_ptr, theta_ptr, cm_real_ptr, cm_imag_ptr,
-        d_neg_alpha_ptr, d_theta_ptr, d_cm_real_ptr, d_cm_imag_ptr,
-        N, L,
-        BLOCK_L: tl.constexpr, BLOCK_N: tl.constexpr,
+        grad_out_ptr,
+        neg_alpha_ptr,
+        theta_ptr,
+        cm_real_ptr,
+        cm_imag_ptr,
+        d_neg_alpha_ptr,
+        d_theta_ptr,
+        d_cm_real_ptr,
+        d_cm_imag_ptr,
+        N,
+        L,
+        BLOCK_L: tl.constexpr,
+        BLOCK_N: tl.constexpr,
     ):
         pid_h = tl.program_id(0)
         n_off = tl.arange(0, BLOCK_N)
@@ -162,7 +177,11 @@ if _HAS_TRITON:
             acc_cm_imag += tl.sum(-g2 * decay * sin_a, axis=0)
             acc_neg_alpha += tl.sum(g2 * pos[:, None] * decay * term, axis=0)
             acc_theta += tl.sum(
-                g2 * decay * pos[:, None] * (-cm_real[None, :] * sin_a - cm_imag[None, :] * cos_a), axis=0
+                g2
+                * decay
+                * pos[:, None]
+                * (-cm_real[None, :] * sin_a - cm_imag[None, :] * cos_a),
+                axis=0,
             )
 
         tl.store(d_cm_real_ptr + base_hn, acc_cm_real, mask=n_mask)
@@ -170,7 +189,9 @@ if _HAS_TRITON:
         tl.store(d_neg_alpha_ptr + base_hn, acc_neg_alpha, mask=n_mask)
         tl.store(d_theta_ptr + base_hn, acc_theta, mask=n_mask)
 
-    class _VandermondeKernelFn(torch.autograd.Function):
+    class _VandermondeKernelFn(
+        torch.autograd.Function
+    ):  # pylint: disable=abstract-method
         """kernel[h,l] = 2*sum_n exp(neg_alpha[h,n]*l) *
         (cm_real[h,n]*cos(theta[h,n]*l) - cm_imag[h,n]*sin(theta[h,n]*l)),
         fused forward+backward, (H, N, L) never materialised."""
@@ -183,15 +204,22 @@ if _HAS_TRITON:
             out = torch.empty((h, length), device=neg_alpha.device, dtype=torch.float32)
             grid = (h, triton.cdiv(length, block_l))
             _vandermonde_fwd_kernel[grid](
-                neg_alpha, theta, cm_real, cm_imag, out,
-                n, length, BLOCK_L=block_l, BLOCK_N=block_n,
+                neg_alpha,
+                theta,
+                cm_real,
+                cm_imag,
+                out,
+                n,
+                length,
+                BLOCK_L=block_l,
+                BLOCK_N=block_n,
             )
             ctx.save_for_backward(neg_alpha, theta, cm_real, cm_imag)
             ctx.length, ctx.block_n, ctx.block_l = length, block_n, block_l
             return out
 
         @staticmethod
-        def backward(ctx, grad_out):
+        def backward(ctx, grad_out):  # pylint: disable=arguments-differ
             neg_alpha, theta, cm_real, cm_imag = ctx.saved_tensors
             h, n = neg_alpha.shape
             grad_out = grad_out.contiguous()
@@ -201,9 +229,19 @@ if _HAS_TRITON:
             d_cm_imag = torch.empty_like(cm_imag)
             grid = (h,)
             _vandermonde_bwd_kernel[grid](
-                grad_out, neg_alpha, theta, cm_real, cm_imag,
-                d_neg_alpha, d_theta, d_cm_real, d_cm_imag,
-                n, ctx.length, BLOCK_L=ctx.block_l, BLOCK_N=ctx.block_n,
+                grad_out,
+                neg_alpha,
+                theta,
+                cm_real,
+                cm_imag,
+                d_neg_alpha,
+                d_theta,
+                d_cm_real,
+                d_cm_imag,
+                n,
+                ctx.length,
+                BLOCK_L=ctx.block_l,
+                BLOCK_N=ctx.block_n,
             )
             return d_neg_alpha, d_theta, d_cm_real, d_cm_imag, None
 
@@ -284,8 +322,11 @@ class ResonatorSSMKernel(nn.Module):
             # ever materialising the (H, N/2, L) tensor. See the module
             # comment above _vandermonde_fwd_kernel.
             kernel = _VandermondeKernelFn.apply(
-                dt_a.real.contiguous(), dt_a.imag.contiguous(),
-                c_mod.real.contiguous(), c_mod.imag.contiguous(), length,
+                dt_a.real.contiguous(),
+                dt_a.imag.contiguous(),
+                c_mod.real.contiguous(),
+                c_mod.imag.contiguous(),
+                length,
             )
         else:
             # CPU / no-triton fallback: identical math, naive materialisation.
@@ -653,10 +694,38 @@ class VectorizedDendriticLM(nn.Module):
 # of an 80GB A100; raise batch_size to fill more (watch the GPU gauge). The
 # auto-scaler in main() shrinks these on smaller cards.
 MODEL_PRESETS = {
-    "42m":  {"d_model": 512,  "depth": 6,  "branch_dim": 256,  "batch_size": 256, "grad_accum": 1, "lr": 3e-4},
-    "110m": {"d_model": 768,  "depth": 12, "branch_dim": 384,  "batch_size": 128, "grad_accum": 2, "lr": 3e-4},
-    "500m": {"d_model": 1536, "depth": 18, "branch_dim": 768,  "batch_size": 48,  "grad_accum": 4, "lr": 2e-4},
-    "1b":   {"d_model": 2048, "depth": 22, "branch_dim": 1024, "batch_size": 24,  "grad_accum": 4, "lr": 1.5e-4},
+    "42m": {
+        "d_model": 512,
+        "depth": 6,
+        "branch_dim": 256,
+        "batch_size": 256,
+        "grad_accum": 1,
+        "lr": 3e-4,
+    },
+    "110m": {
+        "d_model": 768,
+        "depth": 12,
+        "branch_dim": 384,
+        "batch_size": 128,
+        "grad_accum": 2,
+        "lr": 3e-4,
+    },
+    "500m": {
+        "d_model": 1536,
+        "depth": 18,
+        "branch_dim": 768,
+        "batch_size": 48,
+        "grad_accum": 4,
+        "lr": 2e-4,
+    },
+    "1b": {
+        "d_model": 2048,
+        "depth": 22,
+        "branch_dim": 1024,
+        "batch_size": 24,
+        "grad_accum": 4,
+        "lr": 1.5e-4,
+    },
 }
 
 
@@ -672,7 +741,9 @@ class Config:
     # Architecture — left None to inherit from the preset.
     d_model: int | None = None
     depth: int | None = None
-    branch_dim: int | None = None  # width of each branch (d_ff = num_branches*branch_dim)
+    branch_dim: int | None = (
+        None  # width of each branch (d_ff = num_branches*branch_dim)
+    )
     n_states: int = 64  # SSM states per channel (N/2 conjugate pole pairs)
     num_branches: int = 8  # dendritic branches per token
     use_checkpoint: bool = True
@@ -722,7 +793,9 @@ class Config:
     # Curriculum.
     steps_per_substep: int = 3000  # try 500+ for a trial run (see token math note)
     log_every: int = 100
-    save_every: int = 100  # write latest.pt locally every N optimizer steps (crash safety)
+    save_every: int = (
+        100  # write latest.pt locally every N optimizer steps (crash safety)
+    )
     hf_push_every: int = 300  # also PUSH to HF Hub every N steps (mid-phase durability)
 
     # Held-out evaluation: hold out the first eval_docs rows of each dataset
@@ -767,7 +840,7 @@ class Config:
     #   humanities scale  -> ("HuggingFaceTB/cosmopedia", "stanford")    6.3GB (broader than philosophy)
     repos: dict = field(
         default_factory=lambda: {
-            "grammar": ("grammarly/coedit", None),          # explicit grammar correction
+            "grammar": ("grammarly/coedit", None),  # explicit grammar correction
             "language": ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
             # Diverse natural-language reasoning (question + chain-of-thought),
             # backtranslated from real corpora — NOT procedural templates, so a
@@ -777,14 +850,19 @@ class Config:
             "math": ("open-web-math/open-web-math", None),
             "physics": ("millawell/wikipedia_field_of_science", None),
             "philosophy": ("sayhan/strix-philosophy-qa", None),
-            "humanities": ("HuggingFaceTB/cosmopedia", "stanford"),  # ~6.3GB academic prose
+            "humanities": (
+                "HuggingFaceTB/cosmopedia",
+                "stanford",
+            ),  # ~6.3GB academic prose
         }
     )
 
     def __post_init__(self):
         # Fill any architecture / batch field left as None from the chosen preset.
         if self.preset not in MODEL_PRESETS:
-            raise ValueError(f"unknown preset {self.preset!r}; choose {list(MODEL_PRESETS)}")
+            raise ValueError(
+                f"unknown preset {self.preset!r}; choose {list(MODEL_PRESETS)}"
+            )
         for key, value in MODEL_PRESETS[self.preset].items():
             if getattr(self, key) is None:
                 setattr(self, key, value)
@@ -899,7 +977,7 @@ def _bw_random_towers(rng, blocks):
     towers, i = [], 0
     while i < len(order):
         k = rng.randint(1, min(3, len(order) - i))
-        towers.append(order[i:i + k])
+        towers.append(order[i : i + k])
         i += k
     return towers
 
@@ -933,25 +1011,49 @@ def _bw_action_spec(state, action):
     predicate set the paper uses.
     """
     kind = action[0]
-    on, ontable, clear, holding = state["on"], state["ontable"], state["clear"], state["holding"]
+    on, ontable, clear, holding = (
+        state["on"],
+        state["ontable"],
+        state["clear"],
+        state["holding"],
+    )
     if kind == "pick-up":
         (x,) = action[1:]
-        preconds = [(f"(clear {x})", x in clear), (f"(ontable {x})", x in ontable),
-                    ("(handempty)", holding is None)]
-        add, del_ = [f"(holding {x})"], [f"(ontable {x})", f"(clear {x})", "(handempty)"]
+        preconds = [
+            (f"(clear {x})", x in clear),
+            (f"(ontable {x})", x in ontable),
+            ("(handempty)", holding is None),
+        ]
+        add, del_ = [f"(holding {x})"], [
+            f"(ontable {x})",
+            f"(clear {x})",
+            "(handempty)",
+        ]
     elif kind == "put-down":
         (x,) = action[1:]
         preconds = [(f"(holding {x})", holding == x)]
-        add, del_ = [f"(ontable {x})", f"(clear {x})", "(handempty)"], [f"(holding {x})"]
+        add, del_ = [f"(ontable {x})", f"(clear {x})", "(handempty)"], [
+            f"(holding {x})"
+        ]
     elif kind == "stack":
         x, y = action[1:]
         preconds = [(f"(holding {x})", holding == x), (f"(clear {y})", y in clear)]
-        add, del_ = [f"(on {x} {y})", f"(clear {x})", "(handempty)"], [f"(holding {x})", f"(clear {y})"]
+        add, del_ = [f"(on {x} {y})", f"(clear {x})", "(handempty)"], [
+            f"(holding {x})",
+            f"(clear {y})",
+        ]
     elif kind == "unstack":
         x, y = action[1:]
-        preconds = [(f"(on {x} {y})", on.get(x) == y), (f"(clear {x})", x in clear),
-                    ("(handempty)", holding is None)]
-        add, del_ = [f"(holding {x})", f"(clear {y})"], [f"(on {x} {y})", f"(clear {x})", "(handempty)"]
+        preconds = [
+            (f"(on {x} {y})", on.get(x) == y),
+            (f"(clear {x})", x in clear),
+            ("(handempty)", holding is None),
+        ]
+        add, del_ = [f"(holding {x})", f"(clear {y})"], [
+            f"(on {x} {y})",
+            f"(clear {x})",
+            "(handempty)",
+        ]
     else:
         raise ValueError(kind)
     return preconds, add, del_
@@ -1004,7 +1106,11 @@ def _bw_solve(init_towers, goal_towers):
 
 
 def _bw_goal_preds(goal_towers):
-    return [f"(on {tower[idx]} {tower[idx - 1]})" for tower in goal_towers for idx in range(1, len(tower))]
+    return [
+        f"(on {tower[idx]} {tower[idx - 1]})"
+        for tower in goal_towers
+        for idx in range(1, len(tower))
+    ]
 
 
 def _bw_render_example(rng, n_blocks, invalid_frac=0.2):
@@ -1022,8 +1128,14 @@ def _bw_render_example(rng, n_blocks, invalid_frac=0.2):
     # Omitting a pick-up/unstack guarantees its paired stack/put-down fails
     # (holding x) next -- a clean, always-valid way to manufacture a plan
     # that is invalid for a known, checkable reason.
-    skip_candidates = [i for i, a in enumerate(plan[:-1]) if a[0] in ("pick-up", "unstack")]
-    skip_idx = rng.choice(skip_candidates) if skip_candidates and rng.random() < invalid_frac else None
+    skip_candidates = [
+        i for i, a in enumerate(plan[:-1]) if a[0] in ("pick-up", "unstack")
+    ]
+    skip_idx = (
+        rng.choice(skip_candidates)
+        if skip_candidates and rng.random() < invalid_frac
+        else None
+    )
 
     state = _bw_state_from_towers(init_towers)
     lines = [
@@ -1042,8 +1154,12 @@ def _bw_render_example(rng, n_blocks, invalid_frac=0.2):
         step += 1
         preconds, add, del_ = _bw_action_spec(state, action)
         applicable = all(ok for _, ok in preconds)
-        lines.append(f"\n[Step {step}: State s{step - 1}  Action a{step}  State s{step}]")
-        lines.append(f"- Current state s{step - 1}: {', '.join(_bw_state_preds(state))}")
+        lines.append(
+            f"\n[Step {step}: State s{step - 1}  Action a{step}  State s{step}]"
+        )
+        lines.append(
+            f"- Current state s{step - 1}: {', '.join(_bw_state_preds(state))}"
+        )
         lines.append(f"- Proposed action a{step}: {_bw_action_str(action)}")
         lines.append("- Precondition check:")
         for name, ok in preconds:
@@ -1059,13 +1175,17 @@ def _bw_render_example(rng, n_blocks, invalid_frac=0.2):
             return "\n".join(lines)
         lines.append("- Action is APPLICABLE")
         state = _bw_apply(state, action)
-        lines.append(f"- Effect application:\n  - Add: {', '.join(add)}\n  - Delete: {', '.join(del_)}")
+        lines.append(
+            f"- Effect application:\n  - Add: {', '.join(add)}\n  - Delete: {', '.join(del_)}"
+        )
         lines.append(f"- Resulting state s{step}: {', '.join(_bw_state_preds(state))}")
 
     # No forced violation was hit -> the full plan ran; confirm the goal.
     cur_preds = set(_bw_state_preds(state))
     achieved = all(g in cur_preds for g in goal_preds)
-    assert achieved, "solver-generated plan did not reach its own goal"  # self-verified, should never fire
+    assert (
+        achieved
+    ), "solver-generated plan did not reach its own goal"  # self-verified, should never fire
     lines.append("\n[GOAL ACHIEVEMENT CHECK]")
     lines.append(f"Required: {', '.join(goal_preds)}")
     for g in goal_preds:
@@ -1102,7 +1222,7 @@ class BlocksworldPlanningStream:
 
 
 def encode_example(name, item, formatters, tokenizer, mask_prompt, chat_format):
-    """Tokenise one (dataset-name, row) into (ids, loss_mask).
+    r"""Tokenise one (dataset-name, row) into (ids, loss_mask).
 
     loss_mask[i] == 1 -> token i is supervised; 0 -> ignored (prompt tokens).
 
@@ -1183,8 +1303,15 @@ class PackedTokenStream:
     by EOS (added inside encode_example).
     """
 
-    def __init__(self, multiplex, formatters, tokenizer, seq_len,
-                 mask_prompt=True, chat_format=False):
+    def __init__(
+        self,
+        multiplex,
+        formatters,
+        tokenizer,
+        seq_len,
+        mask_prompt=True,
+        chat_format=False,
+    ):
         self.mux = iter(multiplex)
         self.formatters = formatters
         self.tokenizer = tokenizer
@@ -1204,8 +1331,12 @@ class PackedTokenStream:
                     return None, None
                 break
             ids, mask = encode_example(
-                name, item, self.formatters, self.tokenizer,
-                self.mask_prompt, self.chat_format,
+                name,
+                item,
+                self.formatters,
+                self.tokenizer,
+                self.mask_prompt,
+                self.chat_format,
             )
             if len(ids) > 5:
                 self.ids_buf.extend(ids)
@@ -1354,8 +1485,10 @@ def build_model_and_optim(cfg: Config, vocab_size: int, device: str):
             )
             print("Optimizer: bitsandbytes AdamW8bit (quantized optimizer state)")
         except ImportError:
-            print("optim_8bit=True but bitsandbytes is not installed "
-                  "(pip install bitsandbytes) -- falling back to plain AdamW.")
+            print(
+                "optim_8bit=True but bitsandbytes is not installed "
+                "(pip install bitsandbytes) -- falling back to plain AdamW."
+            )
     if optimizer is None:
         optimizer = optim.AdamW(param_groups, lr=cfg.lr, betas=(0.9, 0.95))
     return model, optimizer
@@ -1394,7 +1527,9 @@ def fit_batch_size(model, cfg, vocab_size, device):
         eff = cfg.batch_size * cfg.grad_accum
         cfg.batch_size = b
         cfg.grad_accum = max(1, eff // b)
-        print(f"Auto-fit batch -> {b} x accum {cfg.grad_accum} (effective {b * cfg.grad_accum})")
+        print(
+            f"Auto-fit batch -> {b} x accum {cfg.grad_accum} (effective {b * cfg.grad_accum})"
+        )
     else:
         print(f"Batch {b} fits.")
 
@@ -1416,8 +1551,9 @@ def make_scheduler(cfg: Config, optimizer, total_steps: int):
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per,
-                      chat_format=False):
+def build_eval_blocks(
+    eval_loaded, formatters, tokenizer, seq_len, blocks_per, chat_format=False
+):
     """Pack a fixed set of held-out blocks (CPU tensors) **per dataset**.
 
     Returns ``dict[str, list[tuple[Tensor, Tensor]]]`` so callers can evaluate
@@ -1428,8 +1564,12 @@ def build_eval_blocks(eval_loaded, formatters, tokenizer, seq_len, blocks_per,
     for name, ds in eval_loaded.items():
         mux = WeightedMultiplex([ds], [1.0], [name], seed=0)
         stream = PackedTokenStream(
-            mux, formatters, tokenizer, seq_len,
-            mask_prompt=False, chat_format=chat_format,
+            mux,
+            formatters,
+            tokenizer,
+            seq_len,
+            mask_prompt=False,
+            chat_format=chat_format,
         )
         ds_blocks: list[tuple[torch.Tensor, torch.Tensor]] = []
         for _ in range(blocks_per):
@@ -1463,13 +1603,15 @@ def fused_lm_loss(hidden, head_weight, targets, z_weight=0.0, chunk=2048):
     backward pass, so peak logit memory is one chunk, not the whole batch.
     """
     h = hidden.reshape(-1, hidden.size(-1))  # (N, d)
-    t = targets.reshape(-1)                   # (N,)
+    t = targets.reshape(-1)  # (N,)
     n_valid = (t != -100).sum().clamp_min(1)
     ce_sum = h.new_zeros((), dtype=torch.float32)
     z_sum = h.new_zeros((), dtype=torch.float32)
     for i in range(0, h.size(0), chunk):
         hc, tc = h[i : i + chunk], t[i : i + chunk]
-        ce, zs = checkpoint(_chunk_ce_z, hc, head_weight, tc, z_weight, use_reentrant=False)
+        ce, zs = checkpoint(
+            _chunk_ce_z, hc, head_weight, tc, z_weight, use_reentrant=False
+        )
         ce_sum = ce_sum + ce
         z_sum = z_sum + zs
     loss = ce_sum / n_valid
@@ -1533,7 +1675,7 @@ def ssm_diagnostics(model) -> dict:
     half_lives, freqs = [], []
     for blk in model.blocks:
         k = blk.ssm.kernel
-        dt = torch.exp(k.log_dt).unsqueeze(-1)            # (H, 1)
+        dt = torch.exp(k.log_dt).unsqueeze(-1)  # (H, 1)
         alpha = (torch.exp(k.log_A_real) * dt).clamp_min(1e-8)  # (H, N/2)
         half_lives.append((math.log(2) / alpha).flatten().float())
         freqs.append((k.A_imag.abs() * dt).flatten().float())
@@ -1773,7 +1915,9 @@ def main(
     model, optimizer = build_model_and_optim(cfg, vocab_size, device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
     print_ssm_diagnostics(model)  # timescale coverage at init
-    fit_batch_size(model, cfg, vocab_size, device)  # probe VRAM; never OOM on batch again
+    fit_batch_size(
+        model, cfg, vocab_size, device
+    )  # probe VRAM; never OOM on batch again
 
     # Robust dataset loading: drop anything that fails. Each dataset is split
     # into a held-out eval set (first eval_docs rows) and a train set (the rest)
@@ -1803,7 +1947,11 @@ def main(
 
     print("Building held-out eval blocks...")
     eval_blocks_by_name = build_eval_blocks(
-        eval_loaded, formatters, tokenizer, cfg.seq_len, cfg.eval_blocks_per,
+        eval_loaded,
+        formatters,
+        tokenizer,
+        cfg.seq_len,
+        cfg.eval_blocks_per,
         cfg.chat_format,
     )
     total_blocks = sum(len(v) for v in eval_blocks_by_name.values())
@@ -1854,7 +2002,14 @@ def main(
         {
             "name": "Phase_4_Integration",
             "desc": "Language, reasoning, science, philosophy & humanities",
-            "datasets": ["language", "logic", "math", "physics", "philosophy", "humanities"],
+            "datasets": [
+                "language",
+                "logic",
+                "math",
+                "physics",
+                "philosophy",
+                "humanities",
+            ],
             "mixtures": [[0.20, 0.10, 0.10, 0.15, 0.20, 0.25]],
         },
     ]
@@ -1877,11 +2032,17 @@ def main(
         # already-trained model without a full restart.
         if os.path.exists(latest):
             ckpt = torch.load(latest, map_location=device)
-            getattr(model, "_orig_mod", model).load_state_dict(ckpt["model"])  # architecture must match
-            print(f"CONTINUE: loaded weights from {latest} (step {ckpt.get('step', '?')}); "
-                  "starting a fresh stage on the current data mix.")
+            getattr(model, "_orig_mod", model).load_state_dict(
+                ckpt["model"]
+            )  # architecture must match
+            print(
+                f"CONTINUE: loaded weights from {latest} (step {ckpt.get('step', '?')}); "
+                "starting a fresh stage on the current data mix."
+            )
         else:
-            print(f"CONTINUE requested but no checkpoint at {latest} — training from scratch.")
+            print(
+                f"CONTINUE requested but no checkpoint at {latest} — training from scratch."
+            )
     elif cfg.resume and os.path.exists(latest):
         global_step, completed_substeps = load_checkpoint(
             latest, model, optimizer, scheduler, device
@@ -1898,7 +2059,9 @@ def main(
         print("Compiling model with torch.compile() (cfg.torch_compile=True)...")
         model = torch.compile(model)
 
-    print("\nStarting curriculum training...")
+    print(
+        f"\nStarting curriculum training ({total_substeps} total substeps, {total_steps} total steps)..."
+    )
     substep_global = 0  # flat index across all phases, for resume skip-ahead
     tokens_seen = 0
 
@@ -1946,11 +2109,17 @@ def main(
                 [loaded[n] for n in names], weights, names, seed=3407 + substep_idx
             )
             stream = PackedTokenStream(
-                mux, formatters, tokenizer, cfg.seq_len,
-                cfg.mask_prompt_loss, cfg.chat_format,
+                mux,
+                formatters,
+                tokenizer,
+                cfg.seq_len,
+                cfg.mask_prompt_loss,
+                cfg.chat_format,
             )
             streams = [stream]  # single packed stream; batch draws multiple blocks
-            prefetcher = BatchPrefetcher(streams, cfg.batch_size)  # overlap data + compute
+            prefetcher = BatchPrefetcher(
+                streams, cfg.batch_size
+            )  # overlap data + compute
 
             phase_steps = phase.get("steps", cfg.steps_per_substep)
             optimizer.zero_grad(set_to_none=True)
@@ -1971,10 +2140,14 @@ def main(
                 if device == "cuda":
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                         hidden = model(x, return_hidden=True)
-                        loss = fused_lm_loss(hidden, model.lm_head.weight, y, cfg.z_loss_weight)
+                        loss = fused_lm_loss(
+                            hidden, model.lm_head.weight, y, cfg.z_loss_weight
+                        )
                 else:
                     hidden = model(x, return_hidden=True)
-                    loss = fused_lm_loss(hidden, model.lm_head.weight, y, cfg.z_loss_weight)
+                    loss = fused_lm_loss(
+                        hidden, model.lm_head.weight, y, cfg.z_loss_weight
+                    )
 
                 (loss / cfg.grad_accum).backward()
                 tokens_seen += x.numel()
@@ -2095,8 +2268,18 @@ if __name__ == "__main__":
     # e.g.  `... 110m`  `... overwrite 110m`  `... 1b continue`  `... clean 500m`
     args = [a.lower() for a in sys.argv[1:]]
     preset = next((a for a in args if a in MODEL_PRESETS), None)
-    commands = {"pull", "push", "clean", "overwrite", "fresh", "restart",
-                "resume", "continue", "extend", "diagnose"}
+    commands = {
+        "pull",
+        "push",
+        "clean",
+        "overwrite",
+        "fresh",
+        "restart",
+        "resume",
+        "continue",
+        "extend",
+        "diagnose",
+    }
     cmd = next((a for a in args if a in commands), "")
 
     if cmd == "diagnose":
@@ -2104,9 +2287,13 @@ if __name__ == "__main__":
         # checkpoint weights if present; otherwise shows the init spread).
         cfg = Config(preset=preset) if preset else Config()
         m = VectorizedDendriticLM(
-            vocab_size=50257, d_model=cfg.d_model, depth=cfg.depth,
-            n_states=cfg.n_states, num_branches=cfg.num_branches,
-            branch_dim=cfg.branch_dim, use_checkpoint=False,
+            vocab_size=50257,
+            d_model=cfg.d_model,
+            depth=cfg.depth,
+            n_states=cfg.n_states,
+            num_branches=cfg.num_branches,
+            branch_dim=cfg.branch_dim,
+            use_checkpoint=False,
         )
         latest = os.path.join(cfg.output_dir, "latest.pt")
         if os.path.exists(latest):

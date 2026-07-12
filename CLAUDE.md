@@ -51,7 +51,17 @@ uv run python colab_trainable_dendritic_lm.py    # train (default: resume if che
 
 ```bash
 uv sync --extra dev && uv run pytest -q   # unit tests (tests/); CUDA ones skip without a GPU
+uv sync --extra eightbit                  # bitsandbytes (~58MB), for Config.optim_8bit
 ```
+
+`uv.lock` is committed and should stay that way (reproducible installs, like
+any other lockfile) — it's not something to gitignore. `uv sync` alone is
+declarative: it installs only the base dependency set and *prunes* any extras
+(`dev`, `eightbit`) previously installed into the same `.venv`, so re-run with
+`--extra ...` (or `--all-extras`) after a bare `uv sync` if you need them back.
+`bitsandbytes` is optional rather than a base dependency because most work
+here never touches `optim_8bit` (default `False`; only useful under real VRAM
+pressure — a 40GB A100, or the `1b` preset).
 
 Quick self-test — tiny model, learnable synthetic task, **no downloads**, an
 integration-level check that a full train step actually learns (pytest above
