@@ -34,15 +34,24 @@ schedule (warmup → stable plateau → short final decay).
 **Performance.** The resonator's pole→kernel construction (a per-channel
 Vandermonde sum) is a custom fused **Triton kernel** rather than plain PyTorch
 — profiling showed the naive version was ~35% of the whole model's forward
-pass (recomputed again under gradient checkpointing), and being complex-valued
-it was also what broke `torch.compile`'s memory footprint, since Triton has no
-native complex dtype and Inductor fell back to an unfused eager kernel inside
-the compiled graph. With that tensor walled off from `torch.compile` as an
-opaque op, compilation is now safe and on by default (`Config.torch_compile`).
-CUDA-only; falls back to the equivalent PyTorch implementation on CPU or if
-Triton is unavailable (no separate install needed — Triton ships with CUDA
-torch on Linux). Validated against the PyTorch reference (forward + gradients)
-in `tests/test_triton_vandermonde.py`.
+pass (recomputed again under gradient checkpointing). CUDA-only; falls back to
+the equivalent PyTorch implementation on CPU or if Triton is unavailable (no
+separate install needed — Triton ships with CUDA torch on Linux). Validated
+against the PyTorch reference (forward + gradients) in
+`tests/test_triton_vandermonde.py`.
+
+Being complex-valued, that tensor was also what first broke `torch.compile`'s
+memory footprint (Triton has no native complex dtype, so Inductor fell back to
+an unfused eager kernel *inside* the compiled graph). Walling it off from
+dynamo fixed that locally, but a real Colab run still hit a harder failure — a
+different complex op crashing Inductor outright (`AttributeError: 'complex'
+object has no attribute 'get_name'`) rather than just falling back slower.
+The entire complex-valued FFT-conv path (`ResonatorSSM._conv_mix`) is now kept
+out of `torch.compile`'s trace with `torch.compiler.disable()`, not just the
+Vandermonde tensor — but since that fix is unverified against whatever
+torch/Inductor build actually crashed, **`Config.torch_compile` defaults to
+`False`**. Opt in and watch for an `InductorError` mentioning `complex`; if it
+crashes, turn it back off.
 
 ## Curriculum & data
 
@@ -126,9 +135,9 @@ is the model code:
 !pip install -U bitsandbytes
 ```
 
-Use an A100 (High-RAM) runtime — the default preset (`500m`) and `Config`
-defaults (`torch_compile = True`) are tuned for it, not for local iteration
-hardware; use `42m`/`110m` locally instead (see [Usage](#usage)).
+Use an A100 (High-RAM) runtime — the default preset (`500m`) is tuned for it,
+not for local iteration hardware; use `42m`/`110m` locally instead (see
+[Usage](#usage)).
 
 ## Updating the notebook
 
@@ -200,9 +209,11 @@ checkpointing — off trades VRAM for ~30% speed).
 
 Efficiency-related flags:
 
-- **`torch_compile`** (default `True`) — `torch.compile()`s the model. Safe
-  and memory-neutral now that the SSM's complex-valued kernel construction is
-  a Triton op opaque to `torch.compile`'s tracer (see Architecture above).
+- **`torch_compile`** (default `False`) — `torch.compile()`s the model. Opt-in:
+  it has crashed on at least one Colab torch/Inductor build even with the
+  entire complex-valued SSM path walled off from dynamo (see Architecture
+  above). Try it, but revert to `False` if you hit an `InductorError`
+  mentioning `complex`.
 - **`optim_8bit`** (default `False`) — 8-bit AdamW via `bitsandbytes`, cutting
   optimizer-state VRAM ~4x. Only useful under real VRAM pressure (a 40GB A100,
   or the `1b` preset); needs `uv sync --extra eightbit`, and falls back to

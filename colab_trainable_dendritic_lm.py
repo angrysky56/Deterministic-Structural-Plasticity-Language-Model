@@ -59,6 +59,12 @@ try:
 except ImportError:
     _HAS_TRITON = False
 
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _dynamo_disable = torch.compiler.disable
+else:  # very old torch without the public compiler API
+    def _dynamo_disable(fn):
+        return fn
+
 # ==========================================================================
 # 0. TRITON KERNEL  --  fused SSM-kernel Vandermonde construction
 # ==========================================================================
@@ -374,8 +380,23 @@ class ResonatorSSM(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.gate_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Convolutional (training) path: process a full sequence via FFT."""
+    @_dynamo_disable
+    def _conv_mix(self, x: torch.Tensor) -> torch.Tensor:
+        """FFT convolution + skip term -- everything complex-valued in this
+        block. Deliberately kept OUT of torch.compile's trace entirely (not
+        just the Vandermonde tensor the custom Triton kernel already
+        isolates): on at least one Colab torch/Inductor build, compiling this
+        path crashed outright with
+        ``InductorError: AttributeError: 'complex' object has no attribute
+        'get_name'`` inside ``inductor/ir.py``'s ``add_alias`` -- a different,
+        harder failure than the memory blowup seen locally (which only
+        warned "Torchinductor does not support code generation for complex
+        operators" and fell back, slower but correct). Different Inductor
+        versions appear to vary in how gracefully they degrade on complex
+        dtypes, so the safe fix is to never let dynamo trace into ANY of it,
+        not to rely on graceful fallback. The gated readout below has no
+        complex ops and stays compilable.
+        """
         # x: (B, T, H) -> operate along time.
         length = x.size(1)
         u = x.transpose(1, 2)  # (B, H, T)
@@ -388,9 +409,13 @@ class ResonatorSSM(nn.Module):
         u_f = torch.fft.rfft(u32, n=n_fft)  # (B, H, T_f)
         y = torch.fft.irfft(u_f * k_f, n=n_fft)[..., :length]  # (B, H, T)
         y = y + u32 * self.D.unsqueeze(-1)
-        y = y.transpose(1, 2).to(x.dtype)  # (B, T, H)
+        return y.transpose(1, 2).to(x.dtype)  # (B, T, H)
 
-        # Gated readout.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Convolutional (training) path: process a full sequence via FFT."""
+        y = self._conv_mix(x)
+        # Gated readout -- pure real-valued; safe for torch.compile to trace
+        # and fuse.
         return self.out_proj(y) * F.silu(self.gate_proj(x))
 
     def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -755,19 +780,36 @@ class Config:
     # (local); falls back to plain AdamW with a warning if unavailable. Off by
     # default since it changes optimizer numerics and only 500m/1b need it.
     optim_8bit: bool = False
-    # torch.compile() the model. Originally measured ~2.4x peak VRAM for only
-    # ~3% speedup (110m, seq_len 2048, checkpointing on) on a local RTX 3060,
-    # because Inductor can't codegen the complex rfft/irfft SSM kernel (Triton
-    # has no complex dtype) and fell back to an unfused eager kernel *inside*
-    # the compiled graph -- the ~400MB Vandermonde tensor that fallback was
-    # choking on is now built by the custom Triton op in
-    # ResonatorSSMKernel.forward instead (opaque to dynamo, so it's no longer
-    # traced at all), which resolved the memory blowup: post-fix, compiling
-    # the 500m preset costs no extra VRAM and gives a further ~3% on top of
-    # the Triton kernel's own gain (measured on the 3060, which also can't
-    # use Inductor's max-autotune-gemm mode for lack of SMs -- likely a
-    # larger win on an A100). On by default now that it's memory-neutral.
-    torch_compile: bool = True
+    # torch.compile() the model. History here matters -- read before flipping
+    # this on:
+    #   1) Originally, Inductor couldn't codegen the complex rfft/irfft SSM
+    #      kernel (Triton has no complex dtype) and fell back to an unfused
+    #      eager kernel *inside* the compiled graph, ballooning peak VRAM
+    #      ~2.4x for only ~3% speedup (measured on a local RTX 3060).
+    #   2) ResonatorSSMKernel.forward's Vandermonde tensor construction (the
+    #      biggest complex-valued piece) was moved into a custom Triton op,
+    #      opaque to dynamo, which fixed that memory blowup locally.
+    #   3) On an actual Colab run (torch_compile=True was briefly the
+    #      default), that was NOT enough: a *different* torch/Inductor build
+    #      crashed outright -- InductorError: AttributeError: 'complex'
+    #      object has no attribute 'get_name', inside inductor/ir.py's
+    #      add_alias -- from tracing the REMAINING complex ops (pole
+    #      discretisation, rfft/irfft, complex multiply) in
+    #      ResonatorSSM._conv_mix, which didn't reproduce locally (only
+    #      warned there). Inductor's handling of complex dtypes evidently
+    #      isn't consistent across versions/builds.
+    #   4) Fix: ResonatorSSM._conv_mix (the whole complex-valued FFT-conv
+    #      path, not just the Vandermonde piece) is now decorated with
+    #      @_dynamo_disable, so dynamo never traces into ANY complex op
+    #      there, regardless of Inductor version. The real-valued gated
+    #      readout in ResonatorSSM.forward is unaffected and stays
+    #      compilable.
+    # Left OFF by default pending verification of (4) on the environment
+    # where (3) actually happened -- I can only test locally (RTX 3060,
+    # where it never crashed in the first place). If you confirm
+    # torch_compile=True trains cleanly on your Colab image, it's safe to
+    # flip this back on.
+    torch_compile: bool = False
 
     # Data / optimisation (batch_size/grad_accum/lr inherit from the preset if None).
     seq_len: int = 2048  # SSM gives real long context (was 256)
@@ -2052,10 +2094,11 @@ def main(
         )
 
     if cfg.torch_compile and device == "cuda":
-        # fit_batch_size() above tuned batch_size/grad_accum in eager mode;
-        # with the Vandermonde kernel construction now behind an opaque
-        # Triton op (see Config.torch_compile), compiling no longer inflates
-        # peak VRAM measurably, so no extra safety margin is applied here.
+        # See the long comment on Config.torch_compile: this is opt-in, not
+        # the default, because it has crashed on at least one Colab
+        # torch/Inductor build even after walling off the complex-valued SSM
+        # math from dynamo. If this crashes for you with an InductorError
+        # mentioning 'complex', set cfg.torch_compile = False.
         print("Compiling model with torch.compile() (cfg.torch_compile=True)...")
         model = torch.compile(model)
 
