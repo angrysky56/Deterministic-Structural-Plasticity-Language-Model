@@ -51,16 +51,16 @@ per phase. Streaming reads only the slice you consume, so pool size is free; a
 weighted multiplexer samples them (and cycles small sets rather than starving a
 domain). Q&A datasets are wrapped in a `User:/Assistant:` template.
 
-| Domain     | Dataset                                      | Scale        | Role                                       |
-| ---------- | -------------------------------------------- | ------------ | ------------------------------------------ |
-| grammar    | `grammarly/coedit`                           | 82k pairs    | explicit grammar correction                |
-| language   | `HuggingFaceFW/fineweb-edu` (`sample-10BT`)  | 10B tokens   | general English: grammar, vocab, knowledge |
-| logic      | `facebook/natural_reasoning`                 | ~6GB         | question + chain-of-thought, backtranslated from real corpora (not procedural templates, so it can't just be memorised) |
-| planning   | *synthetic, procedural* — see below          | unbounded    | symbolic (Blocksworld) precondition/effect/state-tracking chain-of-thought |
-| math       | `open-web-math/open-web-math`                | 14.7B tokens | mathematical text                          |
-| physics    | `millawell/wikipedia_field_of_science`       | ~9.6GB       | broad science                              |
-| philosophy | `sayhan/strix-philosophy-qa`                 | 134k QA      | philosophy Q&A                             |
-| humanities | `HuggingFaceTB/cosmopedia` (`stanford`)      | ~6.3GB       | academic textbook prose                    |
+| Domain     | Dataset                                     | Scale        | Role                                                                                                                    |
+| ---------- | ------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| grammar    | `grammarly/coedit`                          | 82k pairs    | explicit grammar correction                                                                                             |
+| language   | `HuggingFaceFW/fineweb-edu` (`sample-10BT`) | 10B tokens   | general English: grammar, vocab, knowledge                                                                              |
+| logic      | `facebook/natural_reasoning`                | ~6GB         | question + chain-of-thought, backtranslated from real corpora (not procedural templates, so it can't just be memorised) |
+| planning   | _synthetic, procedural_ — see below         | unbounded    | symbolic (Blocksworld) precondition/effect/state-tracking chain-of-thought                                              |
+| math       | `open-web-math/open-web-math`               | 14.7B tokens | mathematical text                                                                                                       |
+| physics    | `millawell/wikipedia_field_of_science`      | ~9.6GB       | broad science                                                                                                           |
+| philosophy | `sayhan/strix-philosophy-qa`                | 134k QA      | philosophy Q&A                                                                                                          |
+| humanities | `HuggingFaceTB/cosmopedia` (`stanford`)     | ~6.3GB       | academic textbook prose                                                                                                 |
 
 **`planning` is generated, not downloaded.** It's a from-scratch Blocksworld
 STRIPS engine (`BlocksworldPlanningStream`) that procedurally builds a random
@@ -99,7 +99,7 @@ uv run python colab_trainable_dendritic_lm.py    # train (see commands below)
 ```
 
 `uv sync` alone installs only the base dependencies — it's declarative, so it
-will also *remove* any optional extras you'd previously installed into the
+will also _remove_ any optional extras you'd previously installed into the
 same `.venv`. Optional extras (each only needed for a specific `Config` flag,
 off by default):
 
