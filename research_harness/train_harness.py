@@ -176,9 +176,12 @@ class DSPLMHarness(nn.Module):
 # Model architecture
 D_MODEL = 256
 DEPTH = 4
-N_STATES = 16  # SSM states per channel (n_states/2 conjugate pole pairs) -- halved from exp1
+N_STATES = 32  # SSM states per channel (n_states/2 conjugate pole pairs)
 NUM_BRANCHES = 8
-BRANCH_DIM = 64  # d_ff = NUM_BRANCHES * BRANCH_DIM -- halved from exp1 (was 128)
+BRANCH_DIM = 128  # d_ff = NUM_BRANCHES * BRANCH_DIM
+# exp2 (batch 128) and exp3 (n_states=16, branch_dim=64) were both worse than
+# this config -- see results.tsv. Reverted back to exp1's settings, the best
+# of the three tried so far.
 USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
 
 # Optimization
