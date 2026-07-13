@@ -37,10 +37,16 @@ import torch
 # train_harness.py, not this file, when iterating on architecture)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 256        # context length (reduced from upstream's 2048 -- sized
-                         # for a single RTX 3060 5-minute training budget)
+MAX_SEQ_LEN = 1024       # context length. Was 256 (a cautious first guess to
+                         # fit an RTX 3060) -- raised now that we've measured
+                         # actual usage (~2.7/12GB at seq_len=256, batch=64).
+                         # DSP-LM's whole architectural bet is long-context
+                         # SSM mixing vs quadratic attention, so a short window
+                         # doesn't exercise its actual advantage; this is the
+                         # harness's own knob, changing it doesn't touch
+                         # colab_trainable_dendritic_lm.py.
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 4 * 52428  # number of tokens for val eval (reduced to match)
+EVAL_TOKENS = 4 * 52428  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
 # Configuration

@@ -185,8 +185,9 @@ BRANCH_DIM = 128  # d_ff = NUM_BRANCHES * BRANCH_DIM
 USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step -- reverted from exp2 (bigger batch was worse)
-DEVICE_BATCH_SIZE = 64
+TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step -- kept equal to exp1-6 for a clean comparison
+DEVICE_BATCH_SIZE = 16  # exp7: seq_len 256->1024 (4x), batch 64->16 (1/4x) -- same tokens/step, arranged
+                        # as fewer/longer sequences instead of more/shorter ones
 LR = 4e-3  # exp6: exp5's 2e-3 only gave a small further gain over exp4 -- probing for the ceiling
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
