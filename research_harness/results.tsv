@@ -1,0 +1,2 @@
+commit	val_bpb	memory_gb	status	description
+reference	1.333508	1.0	ok	reference point: Karpathy GPT baseline (SDPA fallback) from autoresearch harness, same data/tokenizer/budget, seq_len=256, depth=4, aspect_ratio=64, 98.1M tokens, 5989 steps -- run in the separate autoresearch clone, not this repo

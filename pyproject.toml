@@ -17,6 +17,9 @@ dependencies = [
 # CUDA + Linux/Windows only, hence optional rather than a hard dependency.
 eightbit = ["bitsandbytes>=0.43"]
 dev = ["pytest>=8"]
+# research_harness/: fast-iteration val_bpb harness (see research_harness/README.md).
+# Only needed for that data-prep/eval pipeline, not for training DSP-LM itself.
+harness = ["requests>=2.32", "pyarrow>=21.0", "rustbpe>=0.1", "tiktoken>=0.11"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
