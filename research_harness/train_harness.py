@@ -187,7 +187,7 @@ USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
 # Optimization
 TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step -- reverted from exp2 (bigger batch was worse)
 DEVICE_BATCH_SIZE = 64
-LR = 1e-3  # exp4: raised from 3e-4 -- exp1 was clearly far from converged (~3400 steps)
+LR = 2e-3  # exp5: exp4's 1e-3 was a big win over 3e-4 and still didn't look converged/unstable
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.0
