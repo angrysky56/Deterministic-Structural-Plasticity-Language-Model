@@ -176,13 +176,13 @@ class DSPLMHarness(nn.Module):
 # Model architecture
 D_MODEL = 256
 DEPTH = 4
-N_STATES = 32  # SSM states per channel (n_states/2 conjugate pole pairs)
+N_STATES = 16  # SSM states per channel (n_states/2 conjugate pole pairs) -- halved from exp1
 NUM_BRANCHES = 8
-BRANCH_DIM = 128  # d_ff = NUM_BRANCHES * BRANCH_DIM
+BRANCH_DIM = 64  # d_ff = NUM_BRANCHES * BRANCH_DIM -- halved from exp1 (was 128)
 USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step -- reverted from exp2 (bigger batch was worse)
 DEVICE_BATCH_SIZE = 64
 LR = 3e-4
 WEIGHT_DECAY = 0.1

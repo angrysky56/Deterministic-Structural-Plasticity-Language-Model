@@ -1,2 +1,4 @@
 commit	val_bpb	memory_gb	status	description
 reference	1.333508	1.0	ok	reference point: Karpathy GPT baseline (SDPA fallback) from autoresearch harness, same data/tokenizer/budget, seq_len=256, depth=4, aspect_ratio=64, 98.1M tokens, 5989 steps -- run in the separate autoresearch clone, not this repo
+4aecdcb	1.699685	2.7	ok	exp1: DSP-LM baseline, d_model=256 depth=4 n_states=32 num_branches=8 branch_dim=128, batch=64, lr=3e-4, 55.7M tokens, 3398 steps -- only 2.7/12GB VRAM used, slower per-step than GPT (fft+dendrite overhead not amortized at small batch)
+4aecdcb	1.771479	5.3	worse	exp2: same arch as exp1, batch 64->128 (device), total_batch 16K->32K to use spare VRAM. WORSE: per-step latency scaled up ~2x with batch (compute-bound, not fixed-overhead-bound at this size), so fewer total tokens (51.9M vs 55.7M) in the same 300s -- reverting batch size next.
