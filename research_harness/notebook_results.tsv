@@ -1,0 +1,2 @@
+val_bpb	params_M	seq_len	d_model	depth	n_states	branch_dim	lr	tokens_M	peak_vram_gb	training_min	tok_per_sec	notes
+1.322692	20.4	2048	512	6	64	256	0.004	200.0	37.62	7.8	344760	autoresearch_notebook.py defaults (commit b1b6641), real A100 run. Beats the local-harness GPT reference (1.333508 at seq_len=256) and every 3060 DSP-LM run. peak_vram 37.6/40GB -- close to an A100-40GB's limit, has headroom only on an 80GB card.
