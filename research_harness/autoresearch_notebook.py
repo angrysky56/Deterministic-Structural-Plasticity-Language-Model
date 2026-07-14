@@ -712,54 +712,53 @@ train_tokenizer()
 # transfer to a bigger model here -- expect to re-tune.
 # ==========================================================================
 
-# Architecture -- PUSH 2: the first A100 run (42m-ish: d_model=512/depth=6/
-# branch_dim=256, ~20.4M params) beat the GPT reference (val_bpb 1.323 vs
-# 1.334) at 37.6/40GB VRAM -- essentially no headroom left. Pushing further
-# means going bigger, which means finding memory somewhere else first:
-# gradient checkpointing (below) trades ~20-30% compute for a large cut in
-# activation memory, which is what actually buys room to grow depth/d_model
-# instead of just re-hitting the same VRAM wall. This step targets roughly
-# the project's own "110m" preset (colab_trainable_dendritic_lm.py
-# MODEL_PRESETS) -- about 4x the params of the first A100 run.
-D_MODEL = 768
-DEPTH = 12
+# Architecture -- PUSH 3: push 2 (110m-ish, ~78.4M params, checkpointing +
+# halved batch, guessed conservative because VRAM was unmeasured) beat push 1
+# by a wide margin (val_bpb 1.144 vs 1.323) but only used 9.97/81.92 GB on the
+# real card -- an 80GB A100, not the 40GB assumed. That guess cost real
+# throughput (108K tok/sec vs push 1's 344K) for headroom nobody needed. Two
+# real data points now exist, so this step stops guessing and uses the
+# project's OWN preset for exactly this situation: colab_trainable_dendritic_lm.py's
+# "500m" MODEL_PRESETS entry is the project's actual recommended default for
+# an 80GB A100 (see that file's Config docstring) -- these numbers were
+# already tuned by hand for this exact card, not re-derived here.
+D_MODEL = 1536
+DEPTH = 18
 N_STATES = 64
 NUM_BRANCHES = 8
-BRANCH_DIM = 384
-USE_CHECKPOINT = True  # now load-bearing, not optional -- needed to fit this size
+BRANCH_DIM = 768
+USE_CHECKPOINT = True  # project's own default even at this scale on an 80GB card -- keep it
 
-# Batch -- DEVICE_BATCH_SIZE halved from the first A100 run (64->32) since
-# neither of us can pre-measure actual VRAM for a 4x-bigger model+checkpoint
-# combo without an A100 in hand; better to land safely under budget on the
-# first try than OOM 20+ minutes into a run. TOTAL_BATCH_SIZE kept the same
-# as before (a validated effective batch size) via grad_accum=4 instead.
-# If this comes in well under the VRAM ceiling, DEVICE_BATCH_SIZE is the
-# first knob to raise next round.
+# Batch -- straight from MODEL_PRESETS["500m"]: batch_size=48, grad_accum=4.
 MAX_SEQ_LEN = 2048
-DEVICE_BATCH_SIZE = 32  # 32*2048 = 65536 = 2**16 tokens/fwdbwd -- TOTAL_BATCH_SIZE/this = grad_accum=4
-TOTAL_BATCH_SIZE = 2**18  # unchanged from the first A100 run -- isolates the architecture-size effect
+DEVICE_BATCH_SIZE = 48  # 48*2048 = 98304 tokens/fwdbwd
+TOTAL_BATCH_SIZE = 4 * 48 * 2048  # = 393,216 -- grad_accum=4, matches the preset exactly
 
-# LR: 4e-3 was tuned for a ~20M-param model. Larger models are typically
-# *more* LR-sensitive, not less, and an unstable run wastes the whole
-# session -- dropping to 2e-3 as a safer bet at ~4x the params, plus a short
-# warmup (LR=0 was fine for the small model but is a real risk at this size).
-LR = 2e-3
+# LR -- also straight from the preset (2e-4), not a guess: ~10x lower than
+# push 2's 2e-3. This is the biggest model yet by a wide margin (~445M vs
+# 78.4M, ~5.7x), and the project's own tuning already reflects that larger
+# models here want a substantially lower LR, not just "somewhat lower."
+LR = 2e-4
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.02
 WARMDOWN_RATIO = 0.3
 FINAL_LR_FRAC = 0.0
+# Gradient clipping -- the main project trains with max_grad_norm=1.0; this
+# harness didn't have any clipping until now. Cheap insurance against a loss
+# spike wasting a run that, at this size, is expected to take well over an
+# hour -- add it now rather than after the first spike ruins a real run.
+MAX_GRAD_NORM = 1.0
 
 # THE RULE CHANGE: no fixed 5-minute wall clock. Stop when either the token
 # budget is hit or the wall-clock safety cap trips, whichever comes first.
-# Size TOKEN_BUDGET to something that's actually a meaningful training chunk
-# for your Colab session, not a toy smoke-test number.
-# Bumped 200M->500M for this push: a bigger model both deserves and needs
-# more tokens to be a fair test, not just more parameters at the same budget.
-# Even at a pessimistic ~100K tok/sec (checkpointing + 4x the compute of the
-# first run), that's ~85min -- comfortably inside the 4h safety cap.
+# TOKEN_BUDGET held at 500M (same as push 2) so this is a clean "does 5.7x
+# the capacity improve quality at the same data budget" comparison, not a
+# confound of both size and data changing together. Safety cap raised (4h->6h)
+# since a ~445M-param model is going to be slower per token than push 2's
+# 78.4M and 500M tokens may take a good while longer than push 2's 77min.
 TOKEN_BUDGET = 500_000_000
-WALL_CLOCK_SAFETY_SECONDS = 4 * 3600  # 4h safety net so a bad config can't eat your whole Colab session
+WALL_CLOCK_SAFETY_SECONDS = 6 * 3600
 EVAL_TOKENS = 20 * 52428  # bigger eval sample than the local harness (statistically firmer bpb reading)
 
 # ==========================================================================
@@ -844,6 +843,8 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+
     progress = min(tokens_seen / TOKEN_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     for group in optimizer.param_groups:
@@ -867,7 +868,8 @@ while True:
     if step % 20 == 0:
         print(
             f"\rstep {step:05d} ({100*progress:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | "
-            f"tok/sec: {tok_per_sec:,} | tokens: {tokens_seen/1e6:.1f}M | elapsed: {elapsed/60:.1f}min    ",
+            f"grad_norm: {grad_norm:.2f} | tok/sec: {tok_per_sec:,} | tokens: {tokens_seen/1e6:.1f}M | "
+            f"elapsed: {elapsed/60:.1f}min    ",
             end="",
             flush=True,
         )
