@@ -1,0 +1,6 @@
+muon_lr	val_bpb	embed_no_decay_lr	d_model	d_model_base	depth	n_states	branch_dim	seq_len	notes
+0.005	1.484579	0.008	256	256	6	64	128	1024	Muon-for-hidden-matrices + AdamW-for-embed/no_decay (SingleDeviceMuonWithAuxAdam, research_harness/muon.py). embed_no_decay_lr fixed at the grounded AdamW base_lr (0.008) from mup_sweep_results.tsv.
+0.01	1.485521	0.008	256	256	6	64	128	1024
+0.02	1.475510	0.008	256	256	6	64	128	1024	Best of grid -- also Muon's upstream default (Keller Jordan's Muon README), reached with zero tuning. Beats AdamW's best (val_bpb=1.521978 at swept base_lr=0.008, or 1.512925 at the extended 0.016 point) by ~0.037-0.047 bpb.
+0.05	1.514079	0.008	256	256	6	64	128	1024	Worse than 0.02 -- curve turning back up.
+0.1	1.536243	0.008	256	256	6	64	128	1024	Worse still -- confirms 0.02 is a real peak, not the edge of an undertested range.

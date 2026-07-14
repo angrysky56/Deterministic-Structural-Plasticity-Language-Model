@@ -194,27 +194,19 @@ class DSPLMHarness(nn.Module):
         )
         return dense_flops + fft_flops_per_token
 
-    def setup_optimizer(self, lr, weight_decay, betas):
-        """3 muP-aware param groups (see class docstring for the rule):
-          - embedding (tied to lm_head): width-independent LR == `lr`, no
-            weight decay.
-          - hidden matrices (SSM out_proj/gate_proj, dendrite
-            value_proj/branch_gate/out_proj): LR == `lr` *
-            (d_model_base / d_model) -- the muP AdamW transfer rule --
-            weight decay applied (same convention as the main training
-            script).
-          - structural/no_decay (LayerNorm, biases, SSM kernel poles
-            log_A_real/A_imag/log_dt/C, skip D): width-independent LR ==
-            `lr`, no weight decay -- decaying resonator parameters is
-            harmful, and these aren't standard-transformer components so
-            they're outside published muP coverage; unchanged from before.
-
-        `lr` is meant to be the base LR *tuned at config.d_model_base*, not
-        re-guessed at whatever width this config actually is.
+    def _classify_params(self):
+        """Split params into the 3 muP-aware groups shared by both optimizer
+        paths below: embedding (tied to lm_head), hidden matrices (SSM
+        out_proj/gate_proj, dendrite value_proj/branch_gate/out_proj -- the
+        only params that are both ndim>=2 AND not name-excluded), and
+        structural/no_decay (LayerNorm, biases, and -- by NAME, not ndim --
+        the SSM kernel poles log_A_real/A_imag/log_dt/C + skip D. This
+        matters for Muon: log_A_real and A_imag are themselves 2D tensors
+        (d_model, n_states/2), so an ndim-only filter would incorrectly feed
+        them to Muon's orthogonalization, which has no clear meaning for a
+        per-channel pole array. The explicit ".kernel." name check is what
+        keeps them out regardless of which optimizer consumes this split.
         """
-        cfg = self.config
-        mup_lr = lr * (cfg.d_model_base / cfg.d_model)
-
         embed_id = id(self.embedding.weight)
         embedding_params, hidden_params, no_decay_params = [], [], []
         for name, p in self.named_parameters():
@@ -226,31 +218,62 @@ class DSPLMHarness(nn.Module):
                 no_decay_params.append(p)
             else:
                 hidden_params.append(p)
+        return embedding_params, hidden_params, no_decay_params
+
+    def setup_optimizer(self, lr, weight_decay, betas):
+        """3 muP-aware param groups, all AdamW (see class docstring for the
+        rule): embedding gets width-independent LR == `lr`, no weight decay;
+        hidden matrices get LR == `lr` * (d_model_base / d_model) -- the muP
+        AdamW transfer rule -- with weight decay applied; structural/no_decay
+        params get width-independent LR == `lr`, no weight decay.
+
+        `lr` is meant to be the base LR *tuned at config.d_model_base*, not
+        re-guessed at whatever width this config actually is.
+        """
+        cfg = self.config
+        mup_lr = lr * (cfg.d_model_base / cfg.d_model)
+        embedding_params, hidden_params, no_decay_params = self._classify_params()
 
         param_groups = [
-            dict(
-                kind="adamw",
-                params=embedding_params,
-                lr=lr,
-                betas=betas,
-                weight_decay=0.0,
-            ),
-            dict(
-                kind="adamw",
-                params=hidden_params,
-                lr=mup_lr,
-                betas=betas,
-                weight_decay=weight_decay,
-            ),
-            dict(
-                kind="adamw",
-                params=no_decay_params,
-                lr=lr,
-                betas=betas,
-                weight_decay=0.0,
-            ),
+            dict(kind="adamw", params=embedding_params, lr=lr, betas=betas, weight_decay=0.0),
+            dict(kind="adamw", params=hidden_params, lr=mup_lr, betas=betas, weight_decay=weight_decay),
+            dict(kind="adamw", params=no_decay_params, lr=lr, betas=betas, weight_decay=0.0),
         ]
         optimizer = torch.optim.AdamW(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    def setup_optimizer_muon(self, embed_lr, muon_lr, weight_decay, betas, muon_momentum=0.95):
+        """Same 3-group split as setup_optimizer, but the hidden-matrix group
+        runs Muon instead of AdamW; embedding and no_decay/structural groups
+        stay on AdamW exactly as before (Muon's own README: "other
+        parameters, such as embeddings, classifier heads, and hidden
+        gains/biases should be optimized using standard AdamW").
+
+        `muon_lr` is a DIFFERENT hyperparameter than the AdamW `lr` used
+        elsewhere in this file -- Muon's update is unit-normalized by its
+        Newton-Schulz orthogonalization step (spectral norm ~1 per update),
+        so muon_lr is "learning rate in units of spectral norm per update"
+        per upstream's docstring, not directly comparable to an AdamW LR.
+        Muon's README also states its LR needs no explicit muP width
+        rescaling ("built-in muP scaling... shouldn't need to retune it"),
+        so unlike setup_optimizer's hidden group, muon_lr is passed through
+        unscaled -- no d_model_base/d_model factor. This is a claim from
+        Muon's own docs, not independently re-derived here; the local
+        ablation this method exists for is exactly how we'd notice if it
+        doesn't hold for DSP-LM's architecture.
+        """
+        from muon import SingleDeviceMuonWithAuxAdam
+
+        embedding_params, hidden_params, no_decay_params = self._classify_params()
+
+        param_groups = [
+            dict(use_muon=False, params=embedding_params, lr=embed_lr, betas=betas, weight_decay=0.0),
+            dict(use_muon=True, params=hidden_params, lr=muon_lr, momentum=muon_momentum, weight_decay=weight_decay),
+            dict(use_muon=False, params=no_decay_params, lr=embed_lr, betas=betas, weight_decay=0.0),
+        ]
+        optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -297,12 +320,21 @@ DEVICE_BATCH_SIZE = (
 )
 # Base LR for the muP sweep at d_model_base -- override per run with
 # SWEEP_LR=<value> uv run research_harness/train_harness.py
-LR = float(os.environ.get("SWEEP_LR", 4e-3))
+LR = float(os.environ.get("SWEEP_LR", 8e-3))  # grounded value from the muP sweep (mup_sweep_results.tsv)
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.3  # exp4: shortened from 0.5 -- spend more time at peak LR
 FINAL_LR_FRAC = 0.0
+
+# Optimizer selection -- OPTIMIZER=adamw (default) or OPTIMIZER=muon.
+# MUON_LR is a SEPARATE hyperparameter from LR/SWEEP_LR above -- Muon's
+# update is unit-normalized (spectral norm ~1/step), not comparable to an
+# AdamW LR. See DSPLMHarness.setup_optimizer_muon's docstring. Embedding and
+# no_decay groups still use AdamW at LR (SWEEP_LR) even when OPTIMIZER=muon.
+OPTIMIZER = os.environ.get("OPTIMIZER", "adamw")
+MUON_LR = float(os.environ.get("MUON_LR", 0.02))  # Muon upstream default
+MUON_MOMENTUM = 0.95
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -347,7 +379,16 @@ tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-optimizer = model.setup_optimizer(lr=LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
+if OPTIMIZER == "muon":
+    optimizer = model.setup_optimizer_muon(
+        embed_lr=LR, muon_lr=MUON_LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS, muon_momentum=MUON_MOMENTUM
+    )
+    print(f"Optimizer: Muon (hidden matrices) + AdamW (embed/no_decay) -- muon_lr={MUON_LR}, embed/no_decay lr={LR}")
+elif OPTIMIZER == "adamw":
+    optimizer = model.setup_optimizer(lr=LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
+    print(f"Optimizer: AdamW (all groups) -- base_lr={LR}")
+else:
+    raise ValueError(f"Unknown OPTIMIZER={OPTIMIZER!r}, expected 'adamw' or 'muon'")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
