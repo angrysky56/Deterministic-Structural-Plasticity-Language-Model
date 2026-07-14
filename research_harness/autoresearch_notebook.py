@@ -712,28 +712,41 @@ train_tokenizer()
 # transfer to a bigger model here -- expect to re-tune.
 # ==========================================================================
 
-# Architecture -- this defaults close to the project's own "42m" preset
-# (colab_trainable_dendritic_lm.py MODEL_PRESETS), since an A100 has the
-# headroom the 3060 never did. Bump toward "110m" if you want to go bigger.
-D_MODEL = 512
-DEPTH = 6
+# Architecture -- PUSH 2: the first A100 run (42m-ish: d_model=512/depth=6/
+# branch_dim=256, ~20.4M params) beat the GPT reference (val_bpb 1.323 vs
+# 1.334) at 37.6/40GB VRAM -- essentially no headroom left. Pushing further
+# means going bigger, which means finding memory somewhere else first:
+# gradient checkpointing (below) trades ~20-30% compute for a large cut in
+# activation memory, which is what actually buys room to grow depth/d_model
+# instead of just re-hitting the same VRAM wall. This step targets roughly
+# the project's own "110m" preset (colab_trainable_dendritic_lm.py
+# MODEL_PRESETS) -- about 4x the params of the first A100 run.
+D_MODEL = 768
+DEPTH = 12
 N_STATES = 64
 NUM_BRANCHES = 8
-BRANCH_DIM = 256
-USE_CHECKPOINT = False  # flip on if you go big enough to OOM
+BRANCH_DIM = 384
+USE_CHECKPOINT = True  # now load-bearing, not optional -- needed to fit this size
 
-# Batch -- A100 40GB has ~3.3x a 3060's 12GB (80GB has ~6.6x). Scale
-# DEVICE_BATCH_SIZE to whatever fits; TOTAL_BATCH_SIZE is the real
-# optimizer-step batch (grad-accumulated if DEVICE_BATCH_SIZE doesn't divide it).
-MAX_SEQ_LEN = 2048  # DSP-LM's own project default -- no reason to cap this low anymore
-DEVICE_BATCH_SIZE = 64  # 64*2048 = 131072 = 2**17 tokens/fwdbwd -- divides TOTAL_BATCH_SIZE cleanly (grad_accum=2).
-                        # Reduce this (or flip on USE_CHECKPOINT) if you OOM.
-TOTAL_BATCH_SIZE = 2**18  # ~262K tokens/optimizer-step -- a real pretraining-scale batch, not a toy one
+# Batch -- DEVICE_BATCH_SIZE halved from the first A100 run (64->32) since
+# neither of us can pre-measure actual VRAM for a 4x-bigger model+checkpoint
+# combo without an A100 in hand; better to land safely under budget on the
+# first try than OOM 20+ minutes into a run. TOTAL_BATCH_SIZE kept the same
+# as before (a validated effective batch size) via grad_accum=4 instead.
+# If this comes in well under the VRAM ceiling, DEVICE_BATCH_SIZE is the
+# first knob to raise next round.
+MAX_SEQ_LEN = 2048
+DEVICE_BATCH_SIZE = 32  # 32*2048 = 65536 = 2**16 tokens/fwdbwd -- TOTAL_BATCH_SIZE/this = grad_accum=4
+TOTAL_BATCH_SIZE = 2**18  # unchanged from the first A100 run -- isolates the architecture-size effect
 
-LR = 4e-3  # 3060-harness's best local LR -- treat as a starting guess here, not gospel
+# LR: 4e-3 was tuned for a ~20M-param model. Larger models are typically
+# *more* LR-sensitive, not less, and an unstable run wastes the whole
+# session -- dropping to 2e-3 as a safer bet at ~4x the params, plus a short
+# warmup (LR=0 was fine for the small model but is a real risk at this size).
+LR = 2e-3
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
-WARMUP_RATIO = 0.0
+WARMUP_RATIO = 0.02
 WARMDOWN_RATIO = 0.3
 FINAL_LR_FRAC = 0.0
 
@@ -741,7 +754,11 @@ FINAL_LR_FRAC = 0.0
 # budget is hit or the wall-clock safety cap trips, whichever comes first.
 # Size TOKEN_BUDGET to something that's actually a meaningful training chunk
 # for your Colab session, not a toy smoke-test number.
-TOKEN_BUDGET = 200_000_000  # 200M tokens -- a real chunk, not 5-minutes-on-an-H100's ~500M/300s toy number
+# Bumped 200M->500M for this push: a bigger model both deserves and needs
+# more tokens to be a fair test, not just more parameters at the same budget.
+# Even at a pessimistic ~100K tok/sec (checkpointing + 4x the compute of the
+# first run), that's ~85min -- comfortably inside the 4h safety cap.
+TOKEN_BUDGET = 500_000_000
 WALL_CLOCK_SAFETY_SECONDS = 4 * 3600  # 4h safety net so a bad config can't eat your whole Colab session
 EVAL_TOKENS = 20 * 52428  # bigger eval sample than the local harness (statistically firmer bpb reading)
 
