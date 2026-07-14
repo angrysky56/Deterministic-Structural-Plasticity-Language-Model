@@ -47,8 +47,8 @@ import os
 import pickle
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
-from multiprocessing import Pool
 
 import requests
 import pyarrow.parquet as pq
@@ -95,7 +95,11 @@ MAX_SHARD = 6542
 VAL_SHARD = MAX_SHARD
 VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
 VOCAB_SIZE = 8192
-NUM_TRAIN_SHARDS = 20  # more than the local harness's 10 -- an A100 chews through data faster
+# climbmix-400b-shuffle is ~400B tokens across 6542 shards (~61M tokens/shard).
+# 40 shards is ~2.4B tokens of raw text -- comfortably more than TOKEN_BUDGET
+# below even if you bump it up for a longer real session, so the dataloader
+# won't start cycling back over already-seen shards mid-run.
+NUM_TRAIN_SHARDS = 40
 
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
@@ -133,7 +137,21 @@ def download_single_shard(index):
     return False
 
 
-def download_data(num_shards, download_workers=8):
+def download_data(num_shards, download_workers=16):
+    """Parallel shard download.
+
+    Uses a thread pool, not multiprocessing.Pool. This is I/O-bound (waiting
+    on HTTP requests), so threads are the right tool anyway -- no GIL
+    contention to speak of -- but it's also a correctness fix, not just a
+    style choice: multiprocessing.Pool needs to pickle download_single_shard
+    and re-import this module in each worker process, which breaks inside a
+    Colab/Jupyter notebook (there's no real .py file backing the running
+    cells for a spawned worker to import), and separately, forking a process
+    after CUDA has already been initialised in the parent (which happens
+    above, in the nvidia-smi/torch.cuda calls) is explicitly unsafe per
+    PyTorch's own docs. Threads share the parent process, so neither problem
+    applies.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     num_train = min(num_shards, MAX_SHARD)
     ids = list(range(num_train))
@@ -146,8 +164,8 @@ def download_data(num_shards, download_workers=8):
     needed = len(ids) - existing
     print(f"Data: downloading {needed} shards ({existing} already exist)...")
     workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(download_single_shard, ids))
     ok = sum(1 for r in results if r)
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
 
