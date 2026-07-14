@@ -1,0 +1,7 @@
+lr	val_bpb	d_model	d_model_base	depth	n_states	branch_dim	seq_len	notes
+0.0005	1.631866	256	256	6	64	128	1024	muP base-width sweep (train_harness.py, SWEEP_LR env var). Architecture matches A100 notebook's ratios (n_states=64, branch_dim=d_model/2) so the swept LR is valid to transfer via lr*(d_model_base/d_model).
+0.001	1.589300	256	256	6	64	128	1024
+0.002	1.561740	256	256	6	64	128	1024
+0.004	1.533025	256	256	6	64	128	1024
+0.008	1.521978	256	256	6	64	128	1024	Chosen as BASE_LR for push4 -- diminishing returns visibly start here (next doubling only bought 0.009 bpb), and a much bigger/deeper model is assumed to have less LR headroom than this 6.3M-param proxy, not more.
+0.016	1.512925	256	256	6	64	128	1024	Extra point past the grid to confirm the curve was actually flattening, not just at the edge of an untested range (same mistake exp6 made in the original local sweep, stopping right where gains were still nonzero). No divergence/instability at this LR either.

@@ -615,9 +615,18 @@ class DSPLMConfig:
     num_branches: int = 8
     branch_dim: int = 256
     use_checkpoint: bool = False
+    d_model_base: int = 256  # muP reference width -- see DSPLM docstring
 
 
 class DSPLM(nn.Module):
+    """muP-parametrized DSPLM -- same rule as research_harness/train_harness.py's
+    DSPLMHarness (kept in sync deliberately, see that file's class docstring
+    for the full derivation/caveats). Short version: hidden matrix layers get
+    init std ~ 1/sqrt(fan_in) and AdamW LR ~ 1/d_model, anchored to
+    `d_model_base` so a base LR tuned on the small local 3060 proxy transfers
+    analytically to this notebook's real A100 widths instead of being
+    re-guessed or borrowed from an unrelated preset."""
+
     def __init__(self, config: DSPLMConfig):
         super().__init__()
         self.config = config
@@ -633,20 +642,29 @@ class DSPLM(nn.Module):
         self.norm_out = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight
-        self.apply(self._init_weights)
-        residual_std = 0.02 / math.sqrt(2 * config.depth)
+        self._init_weights_mup()
+
+    def _init_weights_mup(self):
+        cfg = self.config
+        gain = 0.02 * math.sqrt(cfg.d_model_base)
+        embed_id = id(self.embedding.weight)
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and id(module.weight) != embed_id:
+                fan_in = module.weight.shape[1]
+                nn.init.normal_(module.weight, mean=0.0, std=gain / math.sqrt(fan_in))
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+
         for pname, p in self.named_parameters():
             if pname.endswith("out_proj.weight"):
-                nn.init.normal_(p, mean=0.0, std=residual_std)
-
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                fan_in = p.shape[1]
+                std = (gain / math.sqrt(fan_in)) / math.sqrt(2 * cfg.depth)
+                nn.init.normal_(p, mean=0.0, std=std)
 
     def num_scaling_params(self):
         embedding = self.embedding.weight.numel()
@@ -666,17 +684,29 @@ class DSPLM(nn.Module):
         return dense_flops + fft_flops_per_token
 
     def setup_optimizer(self, lr, weight_decay, betas):
-        decay, no_decay = [], []
+        """`lr` is the base LR tuned at config.d_model_base -- see
+        DSPLMHarness.setup_optimizer in train_harness.py for the full
+        3-group muP rationale (embedding / hidden-matrix-scaled / no_decay),
+        mirrored here exactly."""
+        cfg = self.config
+        mup_lr = lr * (cfg.d_model_base / cfg.d_model)
+
+        embed_id = id(self.embedding.weight)
+        embedding_params, hidden_params, no_decay_params = [], [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if p.ndim < 2 or ".kernel." in name or name.endswith(".D"):
-                no_decay.append(p)
+            if id(p) == embed_id:
+                embedding_params.append(p)
+            elif p.ndim < 2 or ".kernel." in name or name.endswith(".D"):
+                no_decay_params.append(p)
             else:
-                decay.append(p)
+                hidden_params.append(p)
+
         param_groups = [
-            dict(kind="adamw", params=decay, lr=lr, betas=betas, weight_decay=weight_decay),
-            dict(kind="adamw", params=no_decay, lr=lr, betas=betas, weight_decay=0.0),
+            dict(kind="adamw", params=embedding_params, lr=lr, betas=betas, weight_decay=0.0),
+            dict(kind="adamw", params=hidden_params, lr=mup_lr, betas=betas, weight_decay=weight_decay),
+            dict(kind="adamw", params=no_decay_params, lr=lr, betas=betas, weight_decay=0.0),
         ]
         optimizer = torch.optim.AdamW(param_groups)
         for group in optimizer.param_groups:
@@ -706,39 +736,52 @@ download_data(NUM_TRAIN_SHARDS)
 train_tokenizer()
 
 # ==========================================================================
-# Hyperparameters -- sized for an A100, not a 3060. These are starting
-# points, not tuned values; the local 3060 harness found lr=4e-3 helped a
-# lot at a tiny 4.8M-param/seq_len=1024 scale, but that doesn't necessarily
-# transfer to a bigger model here -- expect to re-tune.
+# Hyperparameters -- sized for an A100, not a 3060.
 # ==========================================================================
 
-# Architecture -- PUSH 3: push 2 (110m-ish, ~78.4M params, checkpointing +
-# halved batch, guessed conservative because VRAM was unmeasured) beat push 1
-# by a wide margin (val_bpb 1.144 vs 1.323) but only used 9.97/81.92 GB on the
-# real card -- an 80GB A100, not the 40GB assumed. That guess cost real
-# throughput (108K tok/sec vs push 1's 344K) for headroom nobody needed. Two
-# real data points now exist, so this step stops guessing and uses the
-# project's OWN preset for exactly this situation: colab_trainable_dendritic_lm.py's
-# "500m" MODEL_PRESETS entry is the project's actual recommended default for
-# an 80GB A100 (see that file's Config docstring) -- these numbers were
-# already tuned by hand for this exact card, not re-derived here.
+# Architecture -- PUSH 4: identical to push 3 (D_MODEL=1536, DEPTH=18,
+# N_STATES=64, BRANCH_DIM=768, same batch/checkpointing) -- unchanged on
+# purpose. Push 1-3 each guessed or borrowed a new LR at a new size every
+# time (push 1: reused a small-model local value; push 2: halved LR from
+# push 1 with no real justification; push 3: wholesale-borrowed the
+# project's own "500m" MODEL_PRESETS LR, tuned for a different training
+# regime/dataset than this notebook's). Backing those three numbers out
+# through a proper width-scaling law (LR * d_model / d_model_base) gives
+# implied base-width LRs of ~4e-3 (push 1), ~6e-3 (push 2), and ~1.2e-3
+# (push 3) -- they don't agree with each other, which is itself the
+# concrete evidence that none of them were principled: three unrelated
+# guesses, not points on one consistent curve. This run isolates the LR
+# variable instead: same architecture as push 3, but the LR now comes from
+# an actual controlled sweep (research_harness/train_harness.py on the
+# local 3060, muP-parametrized, d_model=256/depth=6/n_states=64 matching
+# this notebook's own ratios) rather than a guess or a borrowed number.
 D_MODEL = 1536
 DEPTH = 18
 N_STATES = 64
 NUM_BRANCHES = 8
 BRANCH_DIM = 768
-USE_CHECKPOINT = True  # project's own default even at this scale on an 80GB card -- keep it
+USE_CHECKPOINT = True
 
-# Batch -- straight from MODEL_PRESETS["500m"]: batch_size=48, grad_accum=4.
+# Batch -- unchanged from push 3 (MODEL_PRESETS["500m"]): batch_size=48, grad_accum=4.
 MAX_SEQ_LEN = 2048
 DEVICE_BATCH_SIZE = 48  # 48*2048 = 98304 tokens/fwdbwd
 TOTAL_BATCH_SIZE = 4 * 48 * 2048  # = 393,216 -- grad_accum=4, matches the preset exactly
 
-# LR -- also straight from the preset (2e-4), not a guess: ~10x lower than
-# push 2's 2e-3. This is the biggest model yet by a wide margin (~445M vs
-# 78.4M, ~5.7x), and the project's own tuning already reflects that larger
-# models here want a substantially lower LR, not just "somewhat lower."
-LR = 2e-4
+# LR -- muP-derived, not guessed or borrowed. BASE_LR=8e-3 is the real,
+# swept-for value: research_harness/train_harness.py ran LR in
+# {5e-4,1e-3,2e-3,4e-3,8e-3,1.6e-2} at d_model_base=256 (same depth=18->6
+# caveat as always -- see DSPLM's docstring -- but same n_states/branch_dim
+# ratio as this config) and got val_bpb 1.632/1.589/1.562/1.533/1.522/1.513:
+# monotonically improving but visibly flattening by 8e-3 (the last doubling
+# to 1.6e-2 only bought 0.009 bpb). BASE_LR is set one step below that
+# flattening point rather than at the literal best-of-grid, on the
+# assumption that a much bigger, deeper model has less LR headroom than a
+# 6.3M-param proxy, not more -- LR passed to setup_optimizer() is this base
+# value; setup_optimizer() itself applies the muP transfer
+# (BASE_LR * d_model_base/d_model) to the hidden-matrix param group.
+BASE_LR = 8e-3
+LR = BASE_LR  # transfer happens inside DSPLM.setup_optimizer via config.d_model_base
+D_MODEL_BASE = 256  # must match the local sweep's d_model_base for the transfer to be valid
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.02
@@ -785,8 +828,10 @@ config = DSPLMConfig(
     num_branches=NUM_BRANCHES,
     branch_dim=BRANCH_DIM,
     use_checkpoint=USE_CHECKPOINT,
+    d_model_base=D_MODEL_BASE,
 )
 print(f"Model config: {asdict(config)}")
+print(f"muP transfer: base_lr={LR} at d_model_base={D_MODEL_BASE} -> hidden-layer lr={LR * D_MODEL_BASE / D_MODEL:.2e} at d_model={D_MODEL}")
 
 model = DSPLM(config).to(device)
 param_counts = model.num_scaling_params()
@@ -925,7 +970,8 @@ experiment_log.append(
         "depth": DEPTH,
         "n_states": N_STATES,
         "branch_dim": BRANCH_DIM,
-        "lr": LR,
+        "base_lr": LR,
+        "hidden_lr": round(LR * D_MODEL_BASE / D_MODEL, 6),
         "tokens_M": round(tokens_seen / 1e6, 1),
         "peak_vram_gb": round(peak_vram_mb / 1024, 2),
     }

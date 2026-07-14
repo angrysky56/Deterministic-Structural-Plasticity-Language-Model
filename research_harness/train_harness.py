@@ -66,10 +66,42 @@ class DSPLMConfig:
     num_branches: int = 8
     branch_dim: int = 128
     use_checkpoint: bool = False
+    d_model_base: int = 256  # muP reference width -- see DSPLMHarness docstring
 
 
 class DSPLMHarness(nn.Module):
-    """DendriticResonatorBlock stack + tied embedding/head, for the harness."""
+    """DendriticResonatorBlock stack + tied embedding/head, muP-parametrized.
+
+    muP (Yang & Hu et al., "Tensor Programs V") for AdamW: "hidden" matrix
+    layers -- weights whose fan_in scales with model width, i.e. every
+    Linear in the SSM/dendrite sublayers except the embedding/tied head --
+    get init std proportional to 1/sqrt(fan_in) (needs no calibration, it's
+    a property of each layer's own shape) and AdamW LR proportional to
+    1/fan_in, i.e. 1/d_model here since fan_in scales with d_model across
+    our presets. The LR rule needs one anchor point, `d_model_base`: a base
+    LR tuned at that reference width transfers to any other width via
+    lr * (d_model_base / d_model) instead of being re-guessed at each scale.
+    This is the correct Adam exponent per Tensor Programs V -- note it is
+    NOT the same as the ad hoc 1/sqrt(width) heuristic used in some GPT
+    baselines (e.g. Karpathy's autoresearch `dmodel_lr_scale`); that
+    heuristic is a coarser approximation, not the derived muP rule.
+
+    Embedding (tied to lm_head) and "structural" parameters (LayerNorm,
+    biases, and DSP-LM's own SSM pole parameters log_A_real/A_imag/log_dt/C)
+    keep width-independent LR/init -- the standard muP treatment for
+    input/output layers and non-matrix parameters. The SSM poles and
+    dendritic branch-gate are novel components with no published muP
+    analysis, so they simply stay on the pre-existing no-decay,
+    width-independent-LR treatment rather than a rule that hasn't been
+    derived for them.
+
+    Caveat, stated plainly: muP formally guarantees transfer across WIDTH at
+    FIXED DEPTH. Our own preset progression changes depth alongside d_model,
+    so applying this transfer rule across those configs is width-transfer
+    under a simultaneous depth change, not the textbook-clean case. Treat a
+    transferred LR as a much better-grounded starting point than an
+    unguided guess or a borrowed number, not as a proven optimum.
+    """
 
     def __init__(self, config: DSPLMConfig):
         super().__init__()
@@ -90,22 +122,37 @@ class DSPLMHarness(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight  # weight tying
 
-        self.apply(self._init_weights)
-        # Scale residual output projections by 1/sqrt(2*depth) (GPT-2 / nanoGPT
-        # trick) so the residual stream doesn't grow with depth.
-        residual_std = 0.02 / math.sqrt(2 * config.depth)
+        self._init_weights_mup()
+
+    def _init_weights_mup(self) -> None:
+        cfg = self.config
+        # Gain calibrated so a hidden layer with fan_in == d_model_base gets
+        # std == 0.02 -- the fixed value the pre-muP harness used and that
+        # the local exp1-8 sweep validated at d_model=256. Other widths then
+        # get the *correct* fan_in-scaled std automatically, not a guess.
+        gain = 0.02 * math.sqrt(cfg.d_model_base)
+        embed_id = id(self.embedding.weight)  # lm_head.weight is the same tensor (tied)
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and id(module.weight) != embed_id:
+                fan_in = module.weight.shape[1]
+                nn.init.normal_(module.weight, mean=0.0, std=gain / math.sqrt(fan_in))
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        # Embedding/tied head: width-independent "input layer" init.
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+
+        # GPT-2/nanoGPT residual-scaling trick, folded into the muP fan_in
+        # std (multiplicatively) rather than overwriting it outright, so
+        # out_proj layers keep their width scaling AND their depth scaling.
         for pname, p in self.named_parameters():
             if pname.endswith("out_proj.weight"):
-                nn.init.normal_(p, mean=0.0, std=residual_std)
-
-    @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                fan_in = p.shape[1]
+                std = (gain / math.sqrt(fan_in)) / math.sqrt(2 * cfg.depth)
+                nn.init.normal_(p, mean=0.0, std=std)
 
     def num_scaling_params(self):
         embedding = self.embedding.weight.numel()
@@ -133,21 +180,42 @@ class DSPLMHarness(nn.Module):
         return dense_flops + fft_flops_per_token
 
     def setup_optimizer(self, lr, weight_decay, betas):
-        """Weight-decay only 2-D projection matrices. Exclude biases,
-        LayerNorm gains (ndim < 2), and the SSM kernel poles (log_A_real,
-        A_imag, log_dt, C) + skip D -- decaying resonator parameters is
-        harmful (same convention as the main DSP-LM training script)."""
-        decay, no_decay = [], []
+        """3 muP-aware param groups (see class docstring for the rule):
+          - embedding (tied to lm_head): width-independent LR == `lr`, no
+            weight decay.
+          - hidden matrices (SSM out_proj/gate_proj, dendrite
+            value_proj/branch_gate/out_proj): LR == `lr` *
+            (d_model_base / d_model) -- the muP AdamW transfer rule --
+            weight decay applied (same convention as the main training
+            script).
+          - structural/no_decay (LayerNorm, biases, SSM kernel poles
+            log_A_real/A_imag/log_dt/C, skip D): width-independent LR ==
+            `lr`, no weight decay -- decaying resonator parameters is
+            harmful, and these aren't standard-transformer components so
+            they're outside published muP coverage; unchanged from before.
+
+        `lr` is meant to be the base LR *tuned at config.d_model_base*, not
+        re-guessed at whatever width this config actually is.
+        """
+        cfg = self.config
+        mup_lr = lr * (cfg.d_model_base / cfg.d_model)
+
+        embed_id = id(self.embedding.weight)
+        embedding_params, hidden_params, no_decay_params = [], [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
                 continue
-            if p.ndim < 2 or ".kernel." in name or name.endswith(".D"):
-                no_decay.append(p)
+            if id(p) == embed_id:
+                embedding_params.append(p)
+            elif p.ndim < 2 or ".kernel." in name or name.endswith(".D"):
+                no_decay_params.append(p)
             else:
-                decay.append(p)
+                hidden_params.append(p)
+
         param_groups = [
-            dict(kind="adamw", params=decay, lr=lr, betas=betas, weight_decay=weight_decay),
-            dict(kind="adamw", params=no_decay, lr=lr, betas=betas, weight_decay=0.0),
+            dict(kind="adamw", params=embedding_params, lr=lr, betas=betas, weight_decay=0.0),
+            dict(kind="adamw", params=hidden_params, lr=mup_lr, betas=betas, weight_decay=weight_decay),
+            dict(kind="adamw", params=no_decay_params, lr=lr, betas=betas, weight_decay=0.0),
         ]
         optimizer = torch.optim.AdamW(param_groups)
         for group in optimizer.param_groups:
@@ -174,20 +242,23 @@ class DSPLMHarness(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Model architecture
+# depth=6, n_states=64 chosen to match the A100 target's ratios (push1/2/3
+# all use n_states=64; d_model_base=256 makes THIS config the muP reference
+# width itself, so its swept LR needs no transfer to be used here).
 D_MODEL = 256
-DEPTH = 4
-N_STATES = 32  # SSM states per channel (n_states/2 conjugate pole pairs)
+DEPTH = 6
+N_STATES = 64  # SSM states per channel (n_states/2 conjugate pole pairs)
 NUM_BRANCHES = 8
 BRANCH_DIM = 128  # d_ff = NUM_BRANCHES * BRANCH_DIM
-# exp2 (batch 128) and exp3 (n_states=16, branch_dim=64) were both worse than
-# this config -- see results.tsv. Reverted back to exp1's settings, the best
-# of the three tried so far.
 USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
+D_MODEL_BASE = 256  # muP reference width -- this run IS the base-width sweep
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step -- kept equal to exp1-6 for a clean comparison
 DEVICE_BATCH_SIZE = 16  # exp7's setting (best tonight) -- exp8 tried seq_len=2048/batch=8, was worse
-LR = 4e-3  # exp6: exp5's 2e-3 only gave a small further gain over exp4 -- probing for the ceiling
+# Base LR for the muP sweep at d_model_base -- override per run with
+# SWEEP_LR=<value> uv run research_harness/train_harness.py
+LR = float(os.environ.get("SWEEP_LR", 4e-3))
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.0
@@ -219,6 +290,7 @@ config = DSPLMConfig(
     num_branches=NUM_BRANCHES,
     branch_dim=BRANCH_DIM,
     use_checkpoint=USE_CHECKPOINT,
+    d_model_base=D_MODEL_BASE,
 )
 print(f"Model config: {asdict(config)}")
 
@@ -352,3 +424,4 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"lr:               {LR}")
