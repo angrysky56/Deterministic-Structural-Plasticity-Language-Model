@@ -37,13 +37,15 @@ import torch
 # train_harness.py, not this file, when iterating on architecture)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # exp8: raised again -- DSP-LM's own project default. Was 256 (a cautious first guess to
-                         # fit an RTX 3060) -- raised now that we've measured
-                         # actual usage (~2.7/12GB at seq_len=256, batch=64).
-                         # DSP-LM's whole architectural bet is long-context
-                         # SSM mixing vs quadratic attention, so a short window
-                         # doesn't exercise its actual advantage; this is the
-                         # harness's own knob, changing it doesn't touch
+MAX_SEQ_LEN = 1024       # exp7's setting -- best result tonight. exp8 tried
+                         # DSP-LM's own project default of 2048 but a batch of
+                         # 8 was too noisy in the fixed time budget; 1024 with
+                         # batch=16 won. Was 256 originally (a cautious first
+                         # guess to fit an RTX 3060, not deliberate). DSP-LM's
+                         # whole architectural bet is long-context SSM mixing
+                         # vs quadratic attention, so a short window doesn't
+                         # exercise its actual advantage; this is the harness's
+                         # own knob, changing it doesn't touch
                          # colab_trainable_dendritic_lm.py.
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 4 * 52428  # number of tokens for val eval

@@ -186,7 +186,7 @@ USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step -- kept equal to exp1-6 for a clean comparison
-DEVICE_BATCH_SIZE = 8  # exp8: seq_len 1024->2048 (2x), batch 16->8 (1/2x) -- same tokens/step
+DEVICE_BATCH_SIZE = 16  # exp7's setting (best tonight) -- exp8 tried seq_len=2048/batch=8, was worse
 LR = 4e-3  # exp6: exp5's 2e-3 only gave a small further gain over exp4 -- probing for the ceiling
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
