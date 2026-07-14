@@ -48,10 +48,10 @@ import pickle
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 
-import requests
 import pyarrow.parquet as pq
+import requests
 import rustbpe
 import tiktoken
 import torch
@@ -87,7 +87,9 @@ if torch.cuda.is_available():
 # point CACHE_DIR there if you want it to survive a runtime restart.
 # ==========================================================================
 
-CACHE_DIR = "/content/dsp_lm_harness_cache"  # change to a Drive path to persist across sessions
+CACHE_DIR = (
+    "/content/dsp_lm_harness_cache"  # change to a Drive path to persist across sessions
+)
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
@@ -157,7 +159,11 @@ def download_data(num_shards, download_workers=16):
     ids = list(range(num_train))
     if VAL_SHARD not in ids:
         ids.append(VAL_SHARD)
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
+    existing = sum(
+        1
+        for i in ids
+        if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet"))
+    )
     if existing == len(ids):
         print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
         return
@@ -171,7 +177,11 @@ def download_data(num_shards, download_workers=16):
 
 
 def list_parquet_files():
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
+    files = sorted(
+        f
+        for f in os.listdir(DATA_DIR)
+        if f.endswith(".parquet") and not f.endswith(".tmp")
+    )
     return [os.path.join(DATA_DIR, f) for f in files]
 
 
@@ -199,19 +209,26 @@ def train_tokenizer():
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
     parquet_files = list_parquet_files()
     if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+        print(
+            "Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first."
+        )
         sys.exit(1)
     print("Tokenizer: training BPE tokenizer...")
     t0 = time.time()
     tokenizer = rustbpe.Tokenizer()
     vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    tokenizer.train_from_iterator(
+        text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN
+    )
     pattern = tokenizer.get_pattern()
     mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
     tokens_offset = len(mergeable_ranks)
     special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
     enc = tiktoken.Encoding(
-        name="rustbpe", pat_str=pattern, mergeable_ranks=mergeable_ranks, special_tokens=special_tokens
+        name="rustbpe",
+        pat_str=pattern,
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_tokens,
     )
     with open(tokenizer_pkl, "wb") as f:
         pickle.dump(enc, f)
@@ -220,7 +237,9 @@ def train_tokenizer():
     token_bytes_list = []
     for token_id in range(enc.n_vocab):
         token_str = enc.decode([token_id])
-        token_bytes_list.append(0 if token_str in special_set else len(token_str.encode("utf-8")))
+        token_bytes_list.append(
+            0 if token_str in special_set else len(token_str.encode("utf-8"))
+        )
     torch.save(torch.tensor(token_bytes_list, dtype=torch.int32), token_bytes_path)
     test = "Hello world! Numbers: 123. Unicode: 你好"
     assert enc.decode(enc.encode_ordinary(test)) == test, "Tokenizer roundtrip failed"
@@ -246,7 +265,11 @@ class Tokenizer:
 
     def encode(self, text, prepend=None, num_threads=8):
         if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+            prepend_id = (
+                prepend
+                if isinstance(prepend, int)
+                else self.enc.encode_single_token(prepend)
+            )
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
             if prepend is not None:
@@ -271,7 +294,9 @@ def get_token_bytes(device="cpu"):
 
 def _document_batches(split, tokenizer_batch_size=128):
     parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found -- run the data prep cell first."
+    assert (
+        len(parquet_paths) > 0
+    ), "No parquet files found -- run the data prep cell first."
     val_path = os.path.join(DATA_DIR, VAL_FILENAME)
     if split == "train":
         parquet_paths = [p for p in parquet_paths if p != val_path]
@@ -326,12 +351,18 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
                         best_idx, best_len = i, doc_len
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos : pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                    row_buffer[row_idx, pos : pos + len(doc)] = torch.tensor(
+                        doc, dtype=torch.long
+                    )
                     pos += len(doc)
                 else:
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    shortest_idx = min(
+                        range(len(doc_buffer)), key=lambda i: len(doc_buffer[i])
+                    )
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos : pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row_buffer[row_idx, pos : pos + remaining] = torch.tensor(
+                        doc[:remaining], dtype=torch.long
+                    )
                     pos += remaining
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
@@ -366,7 +397,15 @@ if _HAS_TRITON:
 
     @triton.jit
     def _vandermonde_fwd_kernel(
-        neg_alpha_ptr, theta_ptr, cm_real_ptr, cm_imag_ptr, out_ptr, N, L, BLOCK_L: tl.constexpr, BLOCK_N: tl.constexpr
+        neg_alpha_ptr,
+        theta_ptr,
+        cm_real_ptr,
+        cm_imag_ptr,
+        out_ptr,
+        N,
+        L,
+        BLOCK_L: tl.constexpr,
+        BLOCK_N: tl.constexpr,
     ):
         pid_h = tl.program_id(0)
         pid_l = tl.program_id(1)
@@ -430,7 +469,11 @@ if _HAS_TRITON:
             acc_cm_imag += tl.sum(-g2 * decay * sin_a, axis=0)
             acc_neg_alpha += tl.sum(g2 * pos[:, None] * decay * term, axis=0)
             acc_theta += tl.sum(
-                g2 * decay * pos[:, None] * (-cm_real[None, :] * sin_a - cm_imag[None, :] * cos_a), axis=0
+                g2
+                * decay
+                * pos[:, None]
+                * (-cm_real[None, :] * sin_a - cm_imag[None, :] * cos_a),
+                axis=0,
             )
         tl.store(d_cm_real_ptr + base_hn, acc_cm_real, mask=n_mask)
         tl.store(d_cm_imag_ptr + base_hn, acc_cm_imag, mask=n_mask)
@@ -446,7 +489,15 @@ if _HAS_TRITON:
             out = torch.empty((h, length), device=neg_alpha.device, dtype=torch.float32)
             grid = (h, triton.cdiv(length, block_l))
             _vandermonde_fwd_kernel[grid](
-                neg_alpha, theta, cm_real, cm_imag, out, n, length, BLOCK_L=block_l, BLOCK_N=block_n
+                neg_alpha,
+                theta,
+                cm_real,
+                cm_imag,
+                out,
+                n,
+                length,
+                BLOCK_L=block_l,
+                BLOCK_N=block_n,
             )
             ctx.save_for_backward(neg_alpha, theta, cm_real, cm_imag)
             ctx.length, ctx.block_n, ctx.block_l = length, block_n, block_l
@@ -484,12 +535,16 @@ class ResonatorSSMKernel(nn.Module):
     def __init__(self, d_model, n_states=64, dt_min=1e-3, dt_max=1e-1):
         super().__init__()
         half = n_states // 2
-        log_dt = torch.rand(d_model) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        log_dt = torch.rand(d_model) * (math.log(dt_max) - math.log(dt_min)) + math.log(
+            dt_min
+        )
         self.log_dt = nn.Parameter(log_dt)
         c = torch.randn(d_model, half, dtype=torch.cfloat)
         self.C = nn.Parameter(torch.view_as_real(c))
         self.log_A_real = nn.Parameter(torch.log(0.5 * torch.ones(d_model, half)))
-        self.A_imag = nn.Parameter(math.pi * torch.arange(half).repeat(d_model, 1).float())
+        self.A_imag = nn.Parameter(
+            math.pi * torch.arange(half).repeat(d_model, 1).float()
+        )
 
     def _discretise(self):
         dt = torch.exp(self.log_dt)
@@ -505,7 +560,11 @@ class ResonatorSSMKernel(nn.Module):
         c_mod = c * b_bar
         if _HAS_TRITON and dt_a.is_cuda:
             kernel = _VandermondeKernelFn.apply(
-                dt_a.real.contiguous(), dt_a.imag.contiguous(), c_mod.real.contiguous(), c_mod.imag.contiguous(), length
+                dt_a.real.contiguous(),
+                dt_a.imag.contiguous(),
+                c_mod.real.contiguous(),
+                c_mod.imag.contiguous(),
+                length,
             )
         else:
             arange = torch.arange(length, device=a_bar.device)
@@ -561,7 +620,14 @@ class ResonatorSSM(nn.Module):
 
 
 class DendriticMLP(nn.Module):
-    def __init__(self, d_model, num_branches=8, branch_dim=256, threshold=0.1, gate_steepness=10.0):
+    def __init__(
+        self,
+        d_model,
+        num_branches=8,
+        branch_dim=256,
+        threshold=0.1,
+        gate_steepness=10.0,
+    ):
         super().__init__()
         self.d_model = d_model
         self.num_branches = num_branches
@@ -575,9 +641,13 @@ class DendriticMLP(nn.Module):
 
     def forward(self, x):
         b, t, _ = x.shape
-        value = F.silu(self.value_proj(x)).view(b, t, self.num_branches, self.branch_dim)
+        value = F.silu(self.value_proj(x)).view(
+            b, t, self.num_branches, self.branch_dim
+        )
         logit = self.branch_gate(x)
-        gate = torch.sigmoid(self.gate_steepness * (torch.sigmoid(logit) - self.threshold))
+        gate = torch.sigmoid(
+            self.gate_steepness * (torch.sigmoid(logit) - self.threshold)
+        )
         gated = value * gate.unsqueeze(-1)
         return self.out_proj(gated.reshape(b, t, self.d_ff))
 
@@ -588,7 +658,9 @@ class DendriticResonatorBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.ssm = ResonatorSSM(d_model, n_states=n_states)
         self.norm2 = nn.LayerNorm(d_model)
-        self.dendrite = DendriticMLP(d_model, num_branches=num_branches, branch_dim=branch_dim)
+        self.dendrite = DendriticMLP(
+            d_model, num_branches=num_branches, branch_dim=branch_dim
+        )
 
     def forward(self, x):
         x = x + self.ssm(self.norm1(x))
@@ -634,7 +706,10 @@ class DSPLM(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 DendriticResonatorBlock(
-                    config.d_model, n_states=config.n_states, num_branches=config.num_branches, branch_dim=config.branch_dim
+                    config.d_model,
+                    n_states=config.n_states,
+                    num_branches=config.num_branches,
+                    branch_dim=config.branch_dim,
                 )
                 for _ in range(config.depth)
             ]
@@ -671,7 +746,12 @@ class DSPLM(nn.Module):
         blocks = sum(p.numel() for p in self.blocks.parameters())
         norm_out = sum(p.numel() for p in self.norm_out.parameters())
         total = sum(p.numel() for p in self.parameters())
-        return {"embedding": embedding, "blocks": blocks, "norm_out": norm_out, "total": total}
+        return {
+            "embedding": embedding,
+            "blocks": blocks,
+            "norm_out": norm_out,
+            "total": total,
+        }
 
     def estimate_flops(self):
         """Rough per-token FLOPs (diagnostic only, not the scored metric)."""
@@ -680,7 +760,10 @@ class DSPLM(nn.Module):
         dense_flops = 6 * (nparams - embed_params)
         t = self.config.sequence_len
         half_states = self.config.n_states // 2
-        fft_flops_per_token = sum(10 * self.config.d_model * half_states * max(1, math.log2(2 * t)) for _ in self.blocks)
+        fft_flops_per_token = sum(
+            10 * self.config.d_model * half_states * max(1, math.log2(2 * t))
+            for _ in self.blocks
+        )
         return dense_flops + fft_flops_per_token
 
     def setup_optimizer(self, lr, weight_decay, betas):
@@ -704,9 +787,27 @@ class DSPLM(nn.Module):
                 hidden_params.append(p)
 
         param_groups = [
-            dict(kind="adamw", params=embedding_params, lr=lr, betas=betas, weight_decay=0.0),
-            dict(kind="adamw", params=hidden_params, lr=mup_lr, betas=betas, weight_decay=weight_decay),
-            dict(kind="adamw", params=no_decay_params, lr=lr, betas=betas, weight_decay=0.0),
+            dict(
+                kind="adamw",
+                params=embedding_params,
+                lr=lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=hidden_params,
+                lr=mup_lr,
+                betas=betas,
+                weight_decay=weight_decay,
+            ),
+            dict(
+                kind="adamw",
+                params=no_decay_params,
+                lr=lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
         ]
         optimizer = torch.optim.AdamW(param_groups)
         for group in optimizer.param_groups:
@@ -723,7 +824,9 @@ class DSPLM(nn.Module):
         x = self.norm_out(x)
         logits = self.lm_head(x).float()
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction=reduction)
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), reduction=reduction
+            )
         return logits
 
 
@@ -765,7 +868,9 @@ USE_CHECKPOINT = True
 # Batch -- unchanged from push 3 (MODEL_PRESETS["500m"]): batch_size=48, grad_accum=4.
 MAX_SEQ_LEN = 2048
 DEVICE_BATCH_SIZE = 48  # 48*2048 = 98304 tokens/fwdbwd
-TOTAL_BATCH_SIZE = 4 * 48 * 2048  # = 393,216 -- grad_accum=4, matches the preset exactly
+TOTAL_BATCH_SIZE = (
+    4 * 48 * 2048
+)  # = 393,216 -- grad_accum=4, matches the preset exactly
 
 # LR -- muP-derived, not guessed or borrowed. BASE_LR=8e-3 is the real,
 # swept-for value: research_harness/train_harness.py ran LR in
@@ -781,7 +886,9 @@ TOTAL_BATCH_SIZE = 4 * 48 * 2048  # = 393,216 -- grad_accum=4, matches the prese
 # (BASE_LR * d_model_base/d_model) to the hidden-matrix param group.
 BASE_LR = 8e-3
 LR = BASE_LR  # transfer happens inside DSPLM.setup_optimizer via config.d_model_base
-D_MODEL_BASE = 256  # must match the local sweep's d_model_base for the transfer to be valid
+D_MODEL_BASE = (
+    256  # must match the local sweep's d_model_base for the transfer to be valid
+)
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.02
@@ -802,7 +909,9 @@ MAX_GRAD_NORM = 1.0
 # 78.4M and 500M tokens may take a good while longer than push 2's 77min.
 TOKEN_BUDGET = 500_000_000
 WALL_CLOCK_SAFETY_SECONDS = 6 * 3600
-EVAL_TOKENS = 20 * 52428  # bigger eval sample than the local harness (statistically firmer bpb reading)
+EVAL_TOKENS = (
+    20 * 52428
+)  # bigger eval sample than the local harness (statistically firmer bpb reading)
 
 # ==========================================================================
 # Setup
@@ -831,7 +940,9 @@ config = DSPLMConfig(
     d_model_base=D_MODEL_BASE,
 )
 print(f"Model config: {asdict(config)}")
-print(f"muP transfer: base_lr={LR} at d_model_base={D_MODEL_BASE} -> hidden-layer lr={LR * D_MODEL_BASE / D_MODEL:.2e} at d_model={D_MODEL}")
+print(
+    f"muP transfer: base_lr={LR} at d_model_base={D_MODEL_BASE} -> hidden-layer lr={LR * D_MODEL_BASE / D_MODEL:.2e} at d_model={D_MODEL}"
+)
 
 model = DSPLM(config).to(device)
 param_counts = model.num_scaling_params()
@@ -842,12 +953,14 @@ num_params = param_counts["total"]
 num_flops_per_token = model.estimate_flops()
 
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0, (
-    f"TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be a multiple of DEVICE_BATCH_SIZE*MAX_SEQ_LEN ({tokens_per_fwdbwd})"
-)
+assert (
+    TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+), f"TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be a multiple of DEVICE_BATCH_SIZE*MAX_SEQ_LEN ({tokens_per_fwdbwd})"
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 effective_total_batch = grad_accum_steps * tokens_per_fwdbwd
-print(f"Tokens/fwdbwd: {tokens_per_fwdbwd:,}  grad_accum: {grad_accum_steps}  effective batch: {effective_total_batch:,}")
+print(
+    f"Tokens/fwdbwd: {tokens_per_fwdbwd:,}  grad_accum: {grad_accum_steps}  effective batch: {effective_total_batch:,}"
+)
 
 optimizer = model.setup_optimizer(lr=LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
 
@@ -855,7 +968,9 @@ train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train
 x, y, epoch = next(train_loader)
 
 expected_steps = TOKEN_BUDGET // effective_total_batch
-print(f"Token budget: {TOKEN_BUDGET:,} (~{expected_steps:,} optimizer steps at this batch size)")
+print(
+    f"Token budget: {TOKEN_BUDGET:,} (~{expected_steps:,} optimizer steps at this batch size)"
+)
 print(f"Wall-clock safety cap: {WALL_CLOCK_SAFETY_SECONDS}s")
 
 
@@ -924,7 +1039,9 @@ while True:
         print("\nStopping: token budget reached.")
         break
     if elapsed >= WALL_CLOCK_SAFETY_SECONDS:
-        print("\nStopping: wall-clock safety cap reached (token budget not hit -- consider a smaller model/budget).")
+        print(
+            "\nStopping: wall-clock safety cap reached (token budget not hit -- consider a smaller model/budget)."
+        )
         break
 
 print()
@@ -936,7 +1053,9 @@ total_training_time = time.time() - t_start_training
 
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, EVAL_TOKENS)
+    val_bpb = evaluate_bpb(
+        model, tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, EVAL_TOKENS
+    )
 
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 print("---")

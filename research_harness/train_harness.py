@@ -1,4 +1,4 @@
-"""
+r"""
 DSP-LM fast-iteration research harness. Single-GPU, fixed time budget.
 
 Methodology borrowed from Karpathy's `autoresearch` project: a fixed 5-minute
@@ -27,7 +27,7 @@ import gc
 import math
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
@@ -44,8 +44,15 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from prepare_data import (  # noqa: E402
+    MAX_SEQ_LEN,
+    TIME_BUDGET,
+    Tokenizer,
+    evaluate_bpb,
+    make_dataloader,
+)
+
 from colab_trainable_dendritic_lm import DendriticResonatorBlock  # noqa: E402
-from prepare_data import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # DSP-LM model, wired to the harness's fixed contract:
@@ -158,8 +165,15 @@ class DSPLMHarness(nn.Module):
         embedding = self.embedding.weight.numel()
         blocks = sum(p.numel() for p in self.blocks.parameters())
         norm_out = sum(p.numel() for p in self.norm_out.parameters())
-        total = sum(p.numel() for p in self.parameters())  # tied lm_head not double-counted
-        return {"embedding": embedding, "blocks": blocks, "norm_out": norm_out, "total": total}
+        total = sum(
+            p.numel() for p in self.parameters()
+        )  # tied lm_head not double-counted
+        return {
+            "embedding": embedding,
+            "blocks": blocks,
+            "norm_out": norm_out,
+            "total": total,
+        }
 
     def estimate_flops(self):
         """Rough per-token FLOPs estimate (forward+backward). Diagnostic only
@@ -175,7 +189,8 @@ class DSPLMHarness(nn.Module):
         t = self.config.sequence_len
         half_states = self.config.n_states // 2
         fft_flops_per_token = sum(
-            10 * self.config.d_model * half_states * max(1, math.log2(2 * t)) for _ in self.blocks
+            10 * self.config.d_model * half_states * max(1, math.log2(2 * t))
+            for _ in self.blocks
         )
         return dense_flops + fft_flops_per_token
 
@@ -213,9 +228,27 @@ class DSPLMHarness(nn.Module):
                 hidden_params.append(p)
 
         param_groups = [
-            dict(kind="adamw", params=embedding_params, lr=lr, betas=betas, weight_decay=0.0),
-            dict(kind="adamw", params=hidden_params, lr=mup_lr, betas=betas, weight_decay=weight_decay),
-            dict(kind="adamw", params=no_decay_params, lr=lr, betas=betas, weight_decay=0.0),
+            dict(
+                kind="adamw",
+                params=embedding_params,
+                lr=lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=hidden_params,
+                lr=mup_lr,
+                betas=betas,
+                weight_decay=weight_decay,
+            ),
+            dict(
+                kind="adamw",
+                params=no_decay_params,
+                lr=lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
         ]
         optimizer = torch.optim.AdamW(param_groups)
         for group in optimizer.param_groups:
@@ -233,7 +266,9 @@ class DSPLMHarness(nn.Module):
         logits = self.lm_head(x).float()
 
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction=reduction)
+            return F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), reduction=reduction
+            )
         return logits
 
 
@@ -254,8 +289,12 @@ USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
 D_MODEL_BASE = 256  # muP reference width -- this run IS the base-width sweep
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per optimizer step -- kept equal to exp1-6 for a clean comparison
-DEVICE_BATCH_SIZE = 16  # exp7's setting (best tonight) -- exp8 tried seq_len=2048/batch=8, was worse
+TOTAL_BATCH_SIZE = (
+    2**14
+)  # ~16K tokens per optimizer step -- kept equal to exp1-6 for a clean comparison
+DEVICE_BATCH_SIZE = (
+    16  # exp7's setting (best tonight) -- exp8 tried seq_len=2048/batch=8, was worse
+)
 # Base LR for the muP sweep at d_model_base -- override per run with
 # SWEEP_LR=<value> uv run research_harness/train_harness.py
 LR = float(os.environ.get("SWEEP_LR", 4e-3))
@@ -408,7 +447,12 @@ with autocast_ctx:
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = (
-    100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS
+    100
+    * num_flops_per_token
+    * TOTAL_BATCH_SIZE
+    * (step - 10)
+    / total_training_time
+    / H100_BF16_PEAK_FLOPS
     if total_training_time > 0
     else 0
 )

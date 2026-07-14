@@ -18,16 +18,16 @@ Usage:
 Data and tokenizer are stored in ~/.cache/dsp_lm_harness/.
 """
 
+import argparse
+import math
 import os
+import pickle
 import sys
 import time
-import math
-import argparse
-import pickle
 from multiprocessing import Pool
 
-import requests
 import pyarrow.parquet as pq
+import requests
 import rustbpe
 import tiktoken
 import torch
@@ -37,17 +37,17 @@ import torch
 # train_harness.py, not this file, when iterating on architecture)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 1024       # exp7's setting -- best result tonight. exp8 tried
-                         # DSP-LM's own project default of 2048 but a batch of
-                         # 8 was too noisy in the fixed time budget; 1024 with
-                         # batch=16 won. Was 256 originally (a cautious first
-                         # guess to fit an RTX 3060, not deliberate). DSP-LM's
-                         # whole architectural bet is long-context SSM mixing
-                         # vs quadratic attention, so a short window doesn't
-                         # exercise its actual advantage; this is the harness's
-                         # own knob, changing it doesn't touch
-                         # colab_trainable_dendritic_lm.py.
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+MAX_SEQ_LEN = 1024  # exp7's setting -- best result tonight. exp8 tried
+# DSP-LM's own project default of 2048 but a batch of
+# 8 was too noisy in the fixed time budget; 1024 with
+# batch=16 won. Was 256 originally (a cautious first
+# guess to fit an RTX 3060, not deliberate). DSP-LM's
+# whole architectural bet is long-context SSM mixing
+# vs quadratic attention, so a short window doesn't
+# exercise its actual advantage; this is the harness's
+# own knob, changing it doesn't touch
+# colab_trainable_dendritic_lm.py.
+TIME_BUDGET = 300  # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 4 * 52428  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
@@ -116,7 +116,11 @@ def download_data(num_shards, download_workers=8):
     if VAL_SHARD not in ids:
         ids.append(VAL_SHARD)
 
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
+    existing = sum(
+        1
+        for i in ids
+        if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet"))
+    )
     if existing == len(ids):
         print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
         return
@@ -139,7 +143,11 @@ def download_data(num_shards, download_workers=8):
 
 def list_parquet_files():
     """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
+    files = sorted(
+        f
+        for f in os.listdir(DATA_DIR)
+        if f.endswith(".parquet") and not f.endswith(".tmp")
+    )
     return [os.path.join(DATA_DIR, f) for f in files]
 
 
@@ -172,7 +180,9 @@ def train_tokenizer():
 
     parquet_files = list_parquet_files()
     if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+        print(
+            "Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first."
+        )
         sys.exit(1)
 
     print("Tokenizer: training BPE tokenizer...")
@@ -180,7 +190,9 @@ def train_tokenizer():
 
     tokenizer = rustbpe.Tokenizer()
     vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    tokenizer.train_from_iterator(
+        text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN
+    )
 
     pattern = tokenizer.get_pattern()
     mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
@@ -245,7 +257,11 @@ class Tokenizer:
 
     def encode(self, text, prepend=None, num_threads=8):
         if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+            prepend_id = (
+                prepend
+                if isinstance(prepend, int)
+                else self.enc.encode_single_token(prepend)
+            )
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
             if prepend is not None:
@@ -338,12 +354,18 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos : pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                    row_buffer[row_idx, pos : pos + len(doc)] = torch.tensor(
+                        doc, dtype=torch.long
+                    )
                     pos += len(doc)
                 else:
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    shortest_idx = min(
+                        range(len(doc_buffer)), key=lambda i: len(doc_buffer[i])
+                    )
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos : pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row_buffer[row_idx, pos : pos + remaining] = torch.tensor(
+                        doc[:remaining], dtype=torch.long
+                    )
                     pos += remaining
 
         cpu_inputs.copy_(row_buffer[:, :-1])
@@ -388,11 +410,21 @@ def evaluate_bpb(model, tokenizer, batch_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for the DSP-LM research harness")
-    parser.add_argument(
-        "--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned."
+    parser = argparse.ArgumentParser(
+        description="Prepare data and tokenizer for the DSP-LM research harness"
     )
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=10,
+        help="Number of training shards to download (-1 = all). Val shard is always pinned.",
+    )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=8,
+        help="Number of parallel download workers",
+    )
     args = parser.parse_args()
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
