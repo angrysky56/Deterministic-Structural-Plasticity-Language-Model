@@ -75,6 +75,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import statistics
@@ -111,7 +112,41 @@ _SUMMARY_FIELDS = (
     "mfu_percent",
     "gate_k_mean",
     "lambda_mean",
+    "tau_rise_mean",
+    "tau_decay_mean",
 )
+
+
+def permutation_pvalue(treat: list[float], control: list[float]) -> float:
+    """Exact one-tailed permutation p-value that `treat` < `control`.
+
+    The "is the gap bigger than the largest within-variant spread?" heuristic
+    used elsewhere in this report is conservative and throws away rank
+    information: three treatment runs that ALL beat every control run are
+    strong evidence even when each group's internal spread is wide. This
+    enumerates every way to split the pooled runs into two groups of the
+    observed sizes and asks how often chance alone would produce a mean
+    difference at least this favourable.
+
+    With n=3 vs n=3 the smallest achievable p is 1/C(6,3) = 0.05, so treat
+    0.05 here as "as strong as this design can show" rather than as proof --
+    the fix is more seeds, not a different test.
+    """
+    from itertools import combinations
+
+    pooled = treat + control
+    n = len(treat)
+    observed = statistics.mean(treat) - statistics.mean(control)
+    idx = range(len(pooled))
+    at_least_as_extreme = 0
+    total = 0
+    for combo in combinations(idx, n):
+        a = [pooled[i] for i in combo]
+        b = [pooled[i] for i in idx if i not in combo]
+        total += 1
+        if statistics.mean(a) - statistics.mean(b) <= observed:
+            at_least_as_extreme += 1
+    return at_least_as_extreme / total if total else 1.0
 
 
 def _smi(query: str) -> list[str] | None:
@@ -413,16 +448,31 @@ def report(rows: list[dict[str, str]], variants: list[str], token_tol: float) ->
         print("Verdicts withheld: see VALIDITY CHECK above.")
     else:
         print(f"Seed noise (largest within-variant spread): {noise:.4f} bpb")
+        print(f"{'variant':<10} {'delta':>9} {'perm p':>8}  verdict")
         for variant in variants:
             if variant == "baseline" or variant not in by_variant or base_mean is None:
                 continue
-            delta = statistics.mean(by_variant[variant]) - base_mean
-            verdict = (
-                "INSIDE noise, no call"
-                if abs(delta) < noise
-                else ("better than noise" if delta < 0 else "worse than noise")
+            vals = by_variant[variant]
+            delta = statistics.mean(vals) - base_mean
+            p = permutation_pvalue(vals, base) if base else 1.0
+            # Rank-based evidence and spread-based evidence can disagree; when
+            # they do, the permutation test is the one to trust.
+            if p <= 0.05:
+                verdict = "significant (exact permutation)"
+            elif abs(delta) < noise:
+                verdict = "inside seed noise, no call"
+            elif delta < 0:
+                verdict = "better than noise, p>0.05 -- add seeds"
+            else:
+                verdict = "worse"
+            print(f"  {variant:<8} {delta:>+9.4f} {p:>8.3f}  {verdict}")
+        n_min = min(len(v) for v in by_variant.values())
+        if n_min < 4:
+            print(
+                f"\n  note: n={n_min} per variant bounds the smallest reachable\n"
+                f"  p at {1 / math.comb(2 * n_min, n_min):.3f}. Add seeds to "
+                "strengthen, not a different test."
             )
-            print(f"  {variant:<9} {delta:+.4f} -- {verdict}")
 
     print("\nLearned mechanism (init: gate_k=1.0, lambda=4.0):")
     for variant in variants:

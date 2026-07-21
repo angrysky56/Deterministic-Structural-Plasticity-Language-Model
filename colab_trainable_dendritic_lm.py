@@ -2079,6 +2079,9 @@ def print_dendrite_diagnostics(model) -> None:
     header = f"  {'layer':>5} {'gate_k':>9} {'gate_k_max':>11} {'theta':>9}"
     has_lambda = "lambda" in rows[0]
     has_junction = "junction_k_mean" in rows[0]
+    has_tau = "tau_decay_mean" in rows[0]
+    if has_tau:
+        header += f" {'tau_rise':>9} {'tau_decay':>10}"
     if has_lambda:
         header += f" {'lambda':>9}"
     if has_junction:
@@ -2089,6 +2092,8 @@ def print_dendrite_diagnostics(model) -> None:
             f"  {i:>5} {r['gate_k_mean']:>9.3f} {r['gate_k_max']:>11.3f} "
             f"{r['gate_theta_mean']:>9.3f}"
         )
+        if has_tau:
+            line += f" {r['tau_rise_mean']:>9.3f} {r['tau_decay_mean']:>10.3f}"
         if has_lambda:
             line += f" {r['lambda']:>9.3f}"
         if has_junction:

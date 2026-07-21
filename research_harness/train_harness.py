@@ -621,3 +621,11 @@ if DENDRITE_VARIANT != "baseline":
     if "lambda" in _rows[0]:
         _l = [r["lambda"] for r in _rows]
         print(f"lambda_mean:      {sum(_l) / len(_l):.4f}")
+    if "tau_decay_mean" in _rows[0]:
+        # Did the branches lengthen their NMDA integration windows? This is
+        # the readout that says whether temporal integration is being used or
+        # collapsed back to an instantaneous gate.
+        _tr = [r["tau_rise_mean"] for r in _rows]
+        _td = [r["tau_decay_mean"] for r in _rows]
+        print(f"tau_rise_mean:    {sum(_tr) / len(_tr):.4f}")
+        print(f"tau_decay_mean:   {sum(_td) / len(_td):.4f}")
