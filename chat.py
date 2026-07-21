@@ -27,7 +27,18 @@ from transformers import AutoTokenizer
 from colab_trainable_dendritic_lm import VectorizedDendriticLM
 
 # Model kwargs we need to reconstruct the network from a saved config dict.
-_MODEL_KEYS = ("d_model", "depth", "n_states", "num_branches", "branch_dim")
+# `dendrite_variant` changes which parameters exist in the dendrite sublayer,
+# so it must be restored from the checkpoint or load_state_dict will fail on a
+# key mismatch. Older checkpoints predate the field; VectorizedDendriticLM's
+# default ("baseline") is the historical layer, so omitting it stays correct.
+_MODEL_KEYS = (
+    "d_model",
+    "depth",
+    "n_states",
+    "num_branches",
+    "branch_dim",
+    "dendrite_variant",
+)
 
 
 def load_model(checkpoint: str | None, vocab_size: int, device: str):
@@ -37,13 +48,17 @@ def load_model(checkpoint: str | None, vocab_size: int, device: str):
         ckpt = torch.load(checkpoint, map_location=device)
         saved = ckpt.get("config", {})
         kwargs = {k: saved[k] for k in _MODEL_KEYS if k in saved}
-        model = VectorizedDendriticLM(vocab_size=vocab_size, use_checkpoint=False, **kwargs)
+        model = VectorizedDendriticLM(
+            vocab_size=vocab_size, use_checkpoint=False, **kwargs
+        )
         model.load_state_dict(ckpt["model"])
         step = ckpt.get("step", "?")
         print(f"Loaded checkpoint {checkpoint} (optimizer step {step}) config={kwargs}")
     else:
         model = VectorizedDendriticLM(vocab_size=vocab_size, use_checkpoint=False)
-        print("No checkpoint found — using an UNTRAINED model (output will be gibberish).")
+        print(
+            "No checkpoint found — using an UNTRAINED model (output will be gibberish)."
+        )
     return model.to(device).eval()
 
 
@@ -92,18 +107,28 @@ def stream_text(token_iter, tokenizer) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="DSP-LM interactive CLI")
-    ap.add_argument("--preset", default="110m",
-                    help="model size to load (checkpoints are size-keyed)")
-    ap.add_argument("--checkpoint", default=None,
-                    help="explicit checkpoint path (overrides --preset)")
+    ap.add_argument(
+        "--preset",
+        default="110m",
+        help="model size to load (checkpoints are size-keyed)",
+    )
+    ap.add_argument(
+        "--checkpoint",
+        default=None,
+        help="explicit checkpoint path (overrides --preset)",
+    )
     ap.add_argument("--chat", action="store_true", help="use User/Assistant template")
     ap.add_argument("--prompt", default=None, help="one-shot prompt (skips the REPL)")
     ap.add_argument("-n", "--max-new", type=int, default=60)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=50)
-    ap.add_argument("--max-context", type=int, default=0,
-                    help="0 = unbounded (SSM has no context limit); >0 caps the "
-                         "FFT-path prefix per step as a compute guard")
+    ap.add_argument(
+        "--max-context",
+        type=int,
+        default=0,
+        help="0 = unbounded (SSM has no context limit); >0 caps the "
+        "FFT-path prefix per step as a compute guard",
+    )
     args = ap.parse_args()
     if args.checkpoint is None:
         args.checkpoint = f"checkpoints/DSP_LM/{args.preset}/latest.pt"
@@ -121,8 +146,14 @@ def main() -> None:
         prompt = f"User: {text}\nAssistant:" if args.chat else text
         ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
         tokens = generate(
-            model, tokenizer, ids, args.max_new, args.temperature,
-            args.top_k, args.max_context, stop_ids,
+            model,
+            tokenizer,
+            ids,
+            args.max_new,
+            args.temperature,
+            args.top_k,
+            args.max_context,
+            stop_ids,
         )
         print("Assistant:" if args.chat else "", end=" " if args.chat else "")
         stream_text(tokens, tokenizer)
@@ -131,8 +162,10 @@ def main() -> None:
         run(args.prompt)
         return
 
-    print(f"DSP-LM CLI on {device} — {'chat' if args.chat else 'completion'} mode. "
-          "Ctrl-C or empty line to quit.\n")
+    print(
+        f"DSP-LM CLI on {device} — {'chat' if args.chat else 'completion'} mode. "
+        "Ctrl-C or empty line to quit.\n"
+    )
     try:
         while True:
             text = input("You: " if args.chat else "> ").strip()

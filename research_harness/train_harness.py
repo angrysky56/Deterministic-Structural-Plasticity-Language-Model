@@ -52,7 +52,11 @@ from prepare_data import (  # noqa: E402
     make_dataloader,
 )
 
-from colab_trainable_dendritic_lm import DendriticResonatorBlock  # noqa: E402
+from colab_trainable_dendritic_lm import (  # noqa: E402
+    DendriticResonatorBlock,
+    dendrite_diagnostics,
+    print_dendrite_diagnostics,
+)
 
 # ---------------------------------------------------------------------------
 # DSP-LM model, wired to the harness's fixed contract:
@@ -74,6 +78,12 @@ class DSPLMConfig:
     branch_dim: int = 128
     use_checkpoint: bool = False
     d_model_base: int = 256  # muP reference width -- see DSPLMHarness docstring
+    # Dendrite mechanism under test -- see DendriticMLP's docstring in the
+    # source of truth. Override per run with
+    #   DENDRITE=tree uv run research_harness/train_harness.py
+    # Nested ablation: baseline -> nmda -> compart -> tree, each adding one
+    # factor at matched parameter count.
+    dendrite_variant: str = "baseline"
 
 
 class DSPLMHarness(nn.Module):
@@ -121,6 +131,7 @@ class DSPLMHarness(nn.Module):
                     n_states=config.n_states,
                     num_branches=config.num_branches,
                     branch_dim=config.branch_dim,
+                    dendrite_variant=config.dendrite_variant,
                 )
                 for _ in range(config.depth)
             ]
@@ -235,16 +246,36 @@ class DSPLMHarness(nn.Module):
         embedding_params, hidden_params, no_decay_params = self._classify_params()
 
         param_groups = [
-            dict(kind="adamw", params=embedding_params, lr=lr, betas=betas, weight_decay=0.0),
-            dict(kind="adamw", params=hidden_params, lr=mup_lr, betas=betas, weight_decay=weight_decay),
-            dict(kind="adamw", params=no_decay_params, lr=lr, betas=betas, weight_decay=0.0),
+            dict(
+                kind="adamw",
+                params=embedding_params,
+                lr=lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
+            dict(
+                kind="adamw",
+                params=hidden_params,
+                lr=mup_lr,
+                betas=betas,
+                weight_decay=weight_decay,
+            ),
+            dict(
+                kind="adamw",
+                params=no_decay_params,
+                lr=lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
         ]
         optimizer = torch.optim.AdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def setup_optimizer_muon(self, embed_lr, muon_lr, weight_decay, betas, muon_momentum=0.95):
+    def setup_optimizer_muon(
+        self, embed_lr, muon_lr, weight_decay, betas, muon_momentum=0.95
+    ):
         """Same 3-group split as setup_optimizer, but the hidden-matrix group
         runs Muon instead of AdamW; embedding and no_decay/structural groups
         stay on AdamW exactly as before (Muon's own README: "other
@@ -269,9 +300,27 @@ class DSPLMHarness(nn.Module):
         embedding_params, hidden_params, no_decay_params = self._classify_params()
 
         param_groups = [
-            dict(use_muon=False, params=embedding_params, lr=embed_lr, betas=betas, weight_decay=0.0),
-            dict(use_muon=True, params=hidden_params, lr=muon_lr, momentum=muon_momentum, weight_decay=weight_decay),
-            dict(use_muon=False, params=no_decay_params, lr=embed_lr, betas=betas, weight_decay=0.0),
+            dict(
+                use_muon=False,
+                params=embedding_params,
+                lr=embed_lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
+            dict(
+                use_muon=True,
+                params=hidden_params,
+                lr=muon_lr,
+                momentum=muon_momentum,
+                weight_decay=weight_decay,
+            ),
+            dict(
+                use_muon=False,
+                params=no_decay_params,
+                lr=embed_lr,
+                betas=betas,
+                weight_decay=0.0,
+            ),
         ]
         optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
         for group in optimizer.param_groups:
@@ -310,6 +359,9 @@ NUM_BRANCHES = 8
 BRANCH_DIM = 128  # d_ff = NUM_BRANCHES * BRANCH_DIM
 USE_CHECKPOINT = False  # small model, VRAM isn't the bottleneck at this scale
 D_MODEL_BASE = 256  # muP reference width -- this run IS the base-width sweep
+# Dendrite mechanism -- override with DENDRITE=<baseline|nmda|compart|tree>.
+# Default stays 'baseline' so every prior number in results.tsv reproduces.
+DENDRITE_VARIANT = os.environ.get("DENDRITE", "baseline")
 
 # Optimization
 TOTAL_BATCH_SIZE = (
@@ -320,7 +372,9 @@ DEVICE_BATCH_SIZE = (
 )
 # Base LR for the muP sweep at d_model_base -- override per run with
 # SWEEP_LR=<value> uv run research_harness/train_harness.py
-LR = float(os.environ.get("SWEEP_LR", 8e-3))  # grounded value from the muP sweep (mup_sweep_results.tsv)
+LR = float(
+    os.environ.get("SWEEP_LR", 8e-3)
+)  # grounded value from the muP sweep (mup_sweep_results.tsv)
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.0
@@ -341,8 +395,12 @@ MUON_MOMENTUM = 0.95
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+# Seed is overridable so an ablation can estimate run-to-run noise before
+# claiming a val_bpb difference is real. Default 42 reproduces every earlier
+# entry in results.tsv.
+SEED = int(os.environ.get("SEED", 42))
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -362,6 +420,7 @@ config = DSPLMConfig(
     branch_dim=BRANCH_DIM,
     use_checkpoint=USE_CHECKPOINT,
     d_model_base=D_MODEL_BASE,
+    dendrite_variant=DENDRITE_VARIANT,
 )
 print(f"Model config: {asdict(config)}")
 
@@ -381,11 +440,19 @@ grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 if OPTIMIZER == "muon":
     optimizer = model.setup_optimizer_muon(
-        embed_lr=LR, muon_lr=MUON_LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS, muon_momentum=MUON_MOMENTUM
+        embed_lr=LR,
+        muon_lr=MUON_LR,
+        weight_decay=WEIGHT_DECAY,
+        betas=ADAM_BETAS,
+        muon_momentum=MUON_MOMENTUM,
     )
-    print(f"Optimizer: Muon (hidden matrices) + AdamW (embed/no_decay) -- muon_lr={MUON_LR}, embed/no_decay lr={LR}")
+    print(
+        f"Optimizer: Muon (hidden matrices) + AdamW (embed/no_decay) -- muon_lr={MUON_LR}, embed/no_decay lr={LR}"
+    )
 elif OPTIMIZER == "adamw":
-    optimizer = model.setup_optimizer(lr=LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
+    optimizer = model.setup_optimizer(
+        lr=LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS
+    )
     print(f"Optimizer: AdamW (all groups) -- base_lr={LR}")
 else:
     raise ValueError(f"Unknown OPTIMIZER={OPTIMIZER!r}, expected 'adamw' or 'muon'")
@@ -510,3 +577,18 @@ print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
 print(f"lr:               {LR}")
+print(f"dendrite_variant: {DENDRITE_VARIANT}")
+print(f"seed:             {SEED}")
+
+# What each layer LEARNED about its own dendrite mechanism. This is the point
+# of the ablation: gate_k rising means the supralinear NMDA transition is being
+# used; lambda falling means the layer chose compartmentalisation. Either can
+# come out flat, which is a real answer and gets reported as one.
+if DENDRITE_VARIANT != "baseline":
+    print_dendrite_diagnostics(model)
+    _rows = dendrite_diagnostics(model)
+    _k = [r["gate_k_mean"] for r in _rows]
+    print(f"gate_k_mean:      {sum(_k) / len(_k):.4f}")
+    if "lambda" in _rows[0]:
+        _l = [r["lambda"] for r in _rows]
+        print(f"lambda_mean:      {sum(_l) / len(_l):.4f}")

@@ -62,8 +62,10 @@ except ImportError:
 if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
     _dynamo_disable = torch.compiler.disable
 else:  # very old torch without the public compiler API
+
     def _dynamo_disable(fn):
         return fn
+
 
 # ==========================================================================
 # 0. TRITON KERNEL  --  fused SSM-kernel Vandermonde construction
@@ -447,23 +449,111 @@ class ResonatorSSM(nn.Module):
 # ==========================================================================
 
 
+DENDRITE_VARIANTS = ("baseline", "nmda", "compart", "tree")
+
+
+def _branch_tree_distance(num_branches: int) -> torch.Tensor:
+    """Pairwise distance between branches on a binary dendritic tree.
+
+    Branch indices are read as paths through a balanced binary tree, so the
+    distance between two branches is twice the number of levels back to their
+    lowest common ancestor::
+
+        h(i, j) = 0                             if i == j
+        h(i, j) = 2 * (floor(log2(i XOR j)) + 1) otherwise
+
+    For 8 branches this yields h in {0, 2, 4, 6}: siblings are close, branches
+    in opposite halves of the tree are maximally far. This is the "stream
+    distance" of the spatial-stream-network literature (Ver Hoef & Peterson
+    2010) — a river network and a dendritic tree are the same object, a
+    branching graph with flow toward one outlet.
+
+    If ``num_branches`` is not a power of two there is no balanced binary tree,
+    so we fall back to chain distance ``|i - j|`` (a single unbranched stream).
+
+    Returns:
+        ``(num_branches, num_branches)`` float32 distance matrix.
+    """
+    idx = torch.arange(num_branches)
+    is_pow2 = num_branches > 0 and (num_branches & (num_branches - 1)) == 0
+    if not is_pow2:
+        return (idx[:, None] - idx[None, :]).abs().float()
+    xor = torch.bitwise_xor(idx[:, None], idx[None, :])
+    # floor(log2(xor)) + 1 == bit_length(xor); 0 for the diagonal.
+    lvl = torch.where(
+        xor > 0,
+        torch.floor(torch.log2(xor.clamp(min=1).float())) + 1.0,
+        torch.zeros_like(xor, dtype=torch.float32),
+    )
+    return 2.0 * lvl
+
+
 class DendriticMLP(nn.Module):
-    """Per-token nonlinear compute via independent dendritic branches.
+    """Per-token nonlinear compute via semi-independent dendritic branches.
 
     The layer fans the token into ``num_branches`` branches, each of width
-    ``branch_dim``. Within its own sub-space each branch locally solves
-    nonlinear logic (SiLU), then an asymmetric soma gate decides whether the
-    branch has "structurally resolved" — a steep sigmoid that pushes unresolved
-    branches toward zero (Type-II-error avoidance). The soma (a down
-    projection) integrates the surviving branch *vectors* back to d_model.
+    ``branch_dim``, gates each branch, and integrates the survivors back to
+    ``d_model`` through a soma projection.
 
-    Fix vs v1 (the "collapse"): v1 reduced each branch to a single SCALAR
-    before integrating, so a huge synaptic projection
-    (d_model * num_branches * branch_hidden) fed a d_model-wide scalar
-    bottleneck and threw away almost all of its own capacity. Here the gate is
-    applied to the full branch VECTOR and the entire branch_dim signal flows
-    into the soma — a gated-GLU dendrite. Non-lossy, fewer params, and the
-    hidden width ``num_branches * branch_dim`` is a clean FFN-style expansion.
+    Four variants, nested so an ablation isolates one factor at a time. All
+    are parameter-matched to within a handful of per-branch scalars, so a
+    val_bpb difference is attributable to mechanism, not capacity:
+
+    ``baseline``
+        The historical layer, kept bit-for-bit so older runs reproduce.
+        NOTE: its gate ``sigmoid(10*(sigmoid(w.x) - 0.1))`` is effectively
+        dead. The double sigmoid bounds it to [0.269, 0.9999] — it can never
+        suppress a branch — and at init (logits~0) every branch sits at 0.982
+        with d(gate)/d(logit) = 0.044. In practice this trains as a plain
+        two-layer SiLU FFN paying ``d_model * num_branches`` params for a
+        near-constant multiplier. Measured, not assumed; see tests.
+
+    ``nmda``
+        Replaces that gate with a *self-gated* supralinear threshold. The
+        gate reads the branch's OWN summed drive rather than an independent
+        projection of the input, which is what makes it a coincidence
+        detector: ``g = sigmoid(k * (drive - theta))`` with ``k`` and
+        ``theta`` learnable per branch. Because ``drive`` scales with the
+        branch's own activation, ``d|out|/d|in| = g + drive * g'`` — output
+        grows *faster* than linearly through the knee (supralinear), is
+        suppressed below it (sublinear), and saturates above. That is the
+        NMDA summation curve Beniaguev et al. (2021) showed to be the sole
+        source of a cortical neuron's I/O depth: delete NMDA from their
+        biophysical model and a 7-layer temporal CNN collapses to one hidden
+        layer. ``k`` is the steepness the human/rat comparison turns on, and
+        it is learnable *and* logged — if training drives it up, the steep
+        nonlinearity is earning its place; if it decays to 0, this mechanism
+        is inert for language and we should say so.
+
+    ``compart``
+        ``nmda`` plus electrical decoupling. ``value_proj`` is masked by
+        ``exp(-h(i,j) / lambda)`` over the branch tree, so a branch reads
+        mostly its own territory of the input and neighbouring territories
+        only weakly. This is the tail-up covariance of Ver Hoef & Peterson
+        (2010): influence flows along the tree and decays with distance
+        along it. ``lambda`` is one learnable scalar per layer and *is* the
+        electrotonic length constant — ``lambda -> 0`` is hard block-diagonal
+        (total compartmentalisation), ``lambda -> inf`` is the dense baseline.
+        Rather than hand-picking a sparsity pattern we let each layer learn
+        how compartmentalised it wants to be, then read it off. The mask is
+        renormalised to unit second moment so it constrains *structure*
+        without also shrinking the init scale (that would confound the
+        ablation with an init change).
+
+    ``tree``
+        ``compart`` plus a nonlinear confluence. Sibling branches merge at a
+        bifurcation and the merged drive passes a second, coarser gate that
+        modulates both children — a branch-point spike gating everything
+        distal to it. Applied multiplicatively so ``out_proj`` keeps its
+        width: a *linear* mixing step before a dense ``out_proj`` would be a
+        no-op (composition of two linear maps is a linear map the dense layer
+        can already express), so the confluence has to be nonlinear to add
+        anything at all.
+
+    History: v1 reduced each branch to a single SCALAR before integrating, so
+    a huge synaptic projection fed a d_model-wide scalar bottleneck and threw
+    away almost all of its capacity. v2 (``baseline`` here) fixed that by
+    gating the full branch VECTOR. v3 adds the mechanisms above.
     """
 
     def __init__(
@@ -473,36 +563,154 @@ class DendriticMLP(nn.Module):
         branch_dim: int = 256,
         threshold: float = 0.1,
         gate_steepness: float = 10.0,
+        variant: str = "baseline",
+        lambda_init: float = 4.0,
     ) -> None:
         super().__init__()
+        if variant not in DENDRITE_VARIANTS:
+            raise ValueError(f"variant={variant!r} not in {DENDRITE_VARIANTS}")
         self.d_model = d_model
         self.num_branches = num_branches
         self.branch_dim = branch_dim
         self.d_ff = num_branches * branch_dim  # total hidden width
         self.threshold = threshold
         self.gate_steepness = gate_steepness
+        self.variant = variant
 
         self.value_proj = nn.Linear(d_model, self.d_ff)  # branch value vectors
-        self.branch_gate = nn.Linear(d_model, num_branches)  # per-branch logic
         self.out_proj = nn.Linear(self.d_ff, d_model)  # soma integration
+
+        if variant == "baseline":
+            self.branch_gate = nn.Linear(d_model, num_branches)
+        else:
+            # Self-gating: no input projection, the branch reads its own drive.
+            # Scale so `drive` has O(1) variance at init regardless of width
+            # (mean of `branch_dim` iid terms shrinks as 1/sqrt(branch_dim)),
+            # which puts theta=0 / k=1 in the responsive part of the sigmoid
+            # instead of the saturated tail the baseline gate starts in.
+            self._drive_scale = math.sqrt(branch_dim)
+            self.gate_log_k = nn.Parameter(torch.zeros(num_branches))  # k = 1
+            self.gate_theta = nn.Parameter(torch.zeros(num_branches))
+
+        if variant in ("compart", "tree"):
+            if d_model % num_branches != 0:
+                raise ValueError(
+                    f"variant={variant!r} needs d_model ({d_model}) divisible "
+                    f"by num_branches ({num_branches}) to assign input "
+                    f"territories to branches."
+                )
+            self.register_buffer(
+                "_tree_dist", _branch_tree_distance(num_branches), persistent=False
+            )
+            self.log_lambda = nn.Parameter(torch.tensor(math.log(lambda_init)))
+
+        if variant == "tree":
+            if num_branches % 2 != 0:
+                raise ValueError(
+                    f"variant='tree' needs an even num_branches, got {num_branches}"
+                )
+            n_junction = num_branches // 2
+            self.junction_log_k = nn.Parameter(torch.zeros(n_junction))
+            self.junction_theta = nn.Parameter(torch.zeros(n_junction))
+
+    # -- internals ---------------------------------------------------------
+
+    def _decay_mask(self, dtype: torch.dtype) -> torch.Tensor:
+        """Tail-up decay mask over ``value_proj``, shape ``(d_ff, d_model)``.
+
+        Computed in float32 (exp of a learnable reciprocal is bf16-hostile),
+        renormalised to unit second moment so masking changes *which* weights
+        matter without changing the init scale, then broadcast from the small
+        ``(num_branches, num_branches)`` territory matrix up to the full
+        weight shape.
+        """
+        lam = self.log_lambda.float().exp().clamp(min=1e-3, max=1e4)
+        m = torch.exp(-self._tree_dist / lam)  # (nb, nb)
+        # Unit second moment: expansion repeats each entry uniformly, so the
+        # second moment of the expanded mask equals that of this small one.
+        m = m / m.pow(2).mean().sqrt().clamp(min=1e-6)
+        return (
+            m.repeat_interleave(self.branch_dim, dim=0)
+            .repeat_interleave(self.d_model // self.num_branches, dim=1)
+            .to(dtype)
+        )
+
+    def _branch_gate_values(self, pre: torch.Tensor) -> torch.Tensor:
+        """Self-gated NMDA nonlinearity from each branch's own drive.
+
+        Args:
+            pre: Branch pre-activations, ``(B, T, num_branches, branch_dim)``.
+
+        Returns:
+            Gate in ``[0, 1)``, ``(B, T, num_branches)``. Unlike the baseline
+            gate this reaches 0, so a branch can actually be silenced.
+        """
+        drive = pre.mean(dim=-1) * self._drive_scale  # (B, T, nb)
+        k = self.gate_log_k.exp()  # positive steepness
+        return torch.sigmoid(k * (drive - self.gate_theta))
+
+    # -- forward -----------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
 
-        # Each branch computes a local nonlinear value vector.
-        value = F.silu(self.value_proj(x)).view(
-            b, t, self.num_branches, self.branch_dim
-        )
+        if self.variant == "baseline":
+            value = F.silu(self.value_proj(x)).view(
+                b, t, self.num_branches, self.branch_dim
+            )
+            logit = self.branch_gate(x)  # (B, T, num_branches)
+            gate = torch.sigmoid(
+                self.gate_steepness * (torch.sigmoid(logit) - self.threshold)
+            )
+            gated = value * gate.unsqueeze(-1)
+            return self.out_proj(gated.reshape(b, t, self.d_ff))
 
-        # Asymmetric soma gate: a branch fires only once structurally resolved.
-        logit = self.branch_gate(x)  # (B, T, num_branches)
-        gate = torch.sigmoid(
-            self.gate_steepness * (torch.sigmoid(logit) - self.threshold)
-        )
+        # Synaptic projection, optionally compartmentalised by tree distance.
+        if self.variant in ("compart", "tree"):
+            weight = self.value_proj.weight * self._decay_mask(
+                self.value_proj.weight.dtype
+            )
+            pre = F.linear(x, weight, self.value_proj.bias)
+        else:
+            pre = self.value_proj(x)
+        pre = pre.view(b, t, self.num_branches, self.branch_dim)
 
-        # Gate the full branch vectors (not a scalar), then integrate.
-        gated = value * gate.unsqueeze(-1)  # (B, T, num_branches, branch_dim)
+        gate = self._branch_gate_values(pre)  # (B, T, nb)
+
+        if self.variant == "tree":
+            # Confluence: siblings merge, the junction gate modulates both.
+            merged = pre.view(b, t, -1, 2, self.branch_dim).sum(dim=3)
+            j_drive = merged.mean(dim=-1) * self._drive_scale  # (B, T, nb/2)
+            j_gate = torch.sigmoid(
+                self.junction_log_k.exp() * (j_drive - self.junction_theta)
+            )
+            gate = gate * j_gate.repeat_interleave(2, dim=-1)
+
+        gated = F.silu(pre) * gate.unsqueeze(-1)
         return self.out_proj(gated.reshape(b, t, self.d_ff))
+
+    # -- diagnostics -------------------------------------------------------
+
+    @torch.no_grad()
+    def diagnostics(self) -> dict[str, float]:
+        """Learned nonlinearity/compartmentalisation readout for this layer.
+
+        ``gate_k`` is the NMDA steepness the layer chose (up => the steep
+        supralinear transition is being used; ~0 => the layer linearised the
+        gate away and the mechanism is inert). ``lambda`` is the electrotonic
+        length constant in branch-tree units (small => compartmentalised,
+        large => the layer reverted to a dense FFN).
+        """
+        out: dict[str, float] = {"variant": self.variant}  # type: ignore[dict-item]
+        if self.variant != "baseline":
+            out["gate_k_mean"] = float(self.gate_log_k.exp().mean())
+            out["gate_k_max"] = float(self.gate_log_k.exp().max())
+            out["gate_theta_mean"] = float(self.gate_theta.mean())
+        if self.variant in ("compart", "tree"):
+            out["lambda"] = float(self.log_lambda.exp())
+        if self.variant == "tree":
+            out["junction_k_mean"] = float(self.junction_log_k.exp().mean())
+        return out
 
 
 # ==========================================================================
@@ -519,13 +727,17 @@ class DendriticResonatorBlock(nn.Module):
         n_states: int = 64,
         num_branches: int = 8,
         branch_dim: int = 256,
+        dendrite_variant: str = "baseline",
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.ssm = ResonatorSSM(d_model, n_states=n_states)
         self.norm2 = nn.LayerNorm(d_model)
         self.dendrite = DendriticMLP(
-            d_model, num_branches=num_branches, branch_dim=branch_dim
+            d_model,
+            num_branches=num_branches,
+            branch_dim=branch_dim,
+            variant=dendrite_variant,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -572,6 +784,7 @@ class VectorizedDendriticLM(nn.Module):
         num_branches: int = 8,
         branch_dim: int = 256,
         use_checkpoint: bool = True,
+        dendrite_variant: str = "baseline",
     ) -> None:
         super().__init__()
         self.use_checkpoint = use_checkpoint
@@ -583,6 +796,7 @@ class VectorizedDendriticLM(nn.Module):
                     n_states=n_states,
                     num_branches=num_branches,
                     branch_dim=branch_dim,
+                    dendrite_variant=dendrite_variant,
                 )
                 for _ in range(depth)
             ]
@@ -771,6 +985,18 @@ class Config:
     )
     n_states: int = 64  # SSM states per channel (N/2 conjugate pole pairs)
     num_branches: int = 8  # dendritic branches per token
+    # Dendrite mechanism — see DendriticMLP's docstring. Nested ablation:
+    #   baseline -> historical layer (its soma gate is measurably dead; it
+    #               trains as a plain SiLU FFN). Kept so old runs reproduce.
+    #   nmda     -> + self-gated supralinear branch threshold (learnable
+    #               steepness k, the human/rat NMDA variable)
+    #   compart  -> + tail-up exp(-h/lambda) masking of value_proj (learnable
+    #               electrotonic length constant lambda per layer)
+    #   tree     -> + nonlinear confluence gate at each bifurcation
+    # Parameter-matched to within a few per-branch scalars, so an ablation
+    # measures mechanism rather than capacity. Run `diagnose` after training
+    # to read the learned k / lambda back out.
+    dendrite_variant: str = "baseline"
     use_checkpoint: bool = True
     # 8-bit AdamW (bitsandbytes): quantizes the momentum/variance buffers to
     # ~1 byte/param instead of fp32's 8, cutting optimizer VRAM ~4x (e.g. ~12GB
@@ -1496,6 +1722,7 @@ def build_model_and_optim(cfg: Config, vocab_size: int, device: str):
         num_branches=cfg.num_branches,
         branch_dim=cfg.branch_dim,
         use_checkpoint=cfg.use_checkpoint,
+        dendrite_variant=cfg.dendrite_variant,
     ).to(device)
 
     # Weight-decay only the 2-D projection/embedding matrices. Exclude biases,
@@ -1750,6 +1977,70 @@ def print_ssm_diagnostics(model) -> None:
     )
 
 
+def dendrite_diagnostics(model) -> list[dict]:
+    """Per-layer learned dendrite parameters, in block order."""
+    return [
+        blk.dendrite.diagnostics()
+        for blk in model.blocks
+        if hasattr(blk, "dendrite") and hasattr(blk.dendrite, "diagnostics")
+    ]
+
+
+def print_dendrite_diagnostics(model) -> None:
+    """Report what each layer LEARNED about its own dendritic mechanism.
+
+    This is the measurement the whole dendrite ablation exists to produce.
+    Read it as follows:
+
+    ``gate_k`` — the NMDA steepness. Initialised at 1.0. Trending up means the
+    layer is sharpening the supralinear transition, i.e. the mechanism the
+    human/rat literature turns on is being actively used. Collapsing toward 0
+    linearises the gate away and says the mechanism is inert for this task.
+
+    ``lambda`` — the electrotonic length constant in branch-tree units
+    (distances are 0/2/4/6 for 8 branches). Initialised at 4.0. Falling means
+    the layer is choosing compartmentalisation; growing large means it is
+    reverting to a dense FFN and rejecting the premise. A layer is allowed to
+    disagree with the hypothesis, and reporting that honestly is the point.
+    """
+    rows = dendrite_diagnostics(model)
+    if not rows or rows[0].get("variant") == "baseline":
+        variant = rows[0].get("variant") if rows else "n/a"
+        print(f"Dendrites: variant={variant!r} — no learned gate/decay to report.")
+        return
+    print(f"Dendrites: variant={rows[0]['variant']!r}, {len(rows)} layers")
+    header = f"  {'layer':>5} {'gate_k':>9} {'gate_k_max':>11} {'theta':>9}"
+    has_lambda = "lambda" in rows[0]
+    has_junction = "junction_k_mean" in rows[0]
+    if has_lambda:
+        header += f" {'lambda':>9}"
+    if has_junction:
+        header += f" {'junc_k':>9}"
+    print(header)
+    for i, r in enumerate(rows):
+        line = (
+            f"  {i:>5} {r['gate_k_mean']:>9.3f} {r['gate_k_max']:>11.3f} "
+            f"{r['gate_theta_mean']:>9.3f}"
+        )
+        if has_lambda:
+            line += f" {r['lambda']:>9.3f}"
+        if has_junction:
+            line += f" {r['junction_k_mean']:>9.3f}"
+        print(line)
+    k_all = [r["gate_k_mean"] for r in rows]
+    print(
+        f"  gate_k: mean={sum(k_all)/len(k_all):.3f} "
+        f"min={min(k_all):.3f} max={max(k_all):.3f} (init 1.0)"
+    )
+    if has_lambda:
+        l_all = [r["lambda"] for r in rows]
+        print(
+            f"  lambda: mean={sum(l_all)/len(l_all):.3f} "
+            f"min={min(l_all):.3f} max={max(l_all):.3f} (init 4.0; "
+            f"small=compartmentalised, large=dense)"
+        )
+
+
 def smoke_test(cfg: Config, device: str) -> None:
     """Validate the whole train step on a LEARNABLE synthetic task.
 
@@ -1765,6 +2056,10 @@ def smoke_test(cfg: Config, device: str) -> None:
     cfg.batch_size, cfg.grad_accum, cfg.n_states = 8, 1, 16
     cfg.num_branches, cfg.branch_dim = 4, 32
     cfg.warmup_steps, cfg.lr = 5, 3e-3
+    # Exercise whichever dendrite mechanism is under test:
+    #   DSP_SMOKE=1 DSP_DENDRITE=tree uv run python colab_trainable_dendritic_lm.py
+    cfg.dendrite_variant = os.environ.get("DSP_DENDRITE", cfg.dendrite_variant)
+    print(f"dendrite_variant: {cfg.dendrite_variant}")
     vocab_size = 256
     n_steps = 60
     baseline = _math.log(vocab_size)
@@ -2337,14 +2632,38 @@ if __name__ == "__main__":
             num_branches=cfg.num_branches,
             branch_dim=cfg.branch_dim,
             use_checkpoint=False,
+            dendrite_variant=cfg.dendrite_variant,
         )
         latest = os.path.join(cfg.output_dir, "latest.pt")
         if os.path.exists(latest):
-            m.load_state_dict(torch.load(latest, map_location="cpu")["model"])
+            ckpt = torch.load(latest, map_location="cpu")
+            # A checkpoint trained under a different dendrite variant has a
+            # different parameter set -- rebuild to match it rather than
+            # failing on a state_dict mismatch.
+            saved_variant = ckpt.get("config", {}).get(
+                "dendrite_variant", cfg.dendrite_variant
+            )
+            if saved_variant != cfg.dendrite_variant:
+                print(
+                    f"[{cfg.preset}] checkpoint was trained with "
+                    f"dendrite_variant={saved_variant!r}; rebuilding to match."
+                )
+                m = VectorizedDendriticLM(
+                    vocab_size=50257,
+                    d_model=cfg.d_model,
+                    depth=cfg.depth,
+                    n_states=cfg.n_states,
+                    num_branches=cfg.num_branches,
+                    branch_dim=cfg.branch_dim,
+                    use_checkpoint=False,
+                    dendrite_variant=saved_variant,
+                )
+            m.load_state_dict(ckpt["model"])
             print(f"[{cfg.preset}] diagnostics from {latest}:")
         else:
             print(f"[{cfg.preset}] no checkpoint; diagnostics at init:")
         print_ssm_diagnostics(m)
+        print_dendrite_diagnostics(m)
         sys.exit(0)
 
     if cmd in ["pull", "push", "clean"]:
