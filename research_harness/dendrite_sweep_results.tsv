@@ -1,10 +1,7 @@
 order	variant	seed	val_bpb	num_params_M	gate_k_mean	lambda_mean	total_tokens_M	num_steps	mfu_percent	peak_vram_mb	elapsed_s	temp_before	temp_after	clock_after	power_after	power_limit_w	throttling_after	status
-1	baseline	42	1.707964	6.3			6.6	400	0.37	3259.9	59	90	91	1470	88.42	170.00	sw_thermal	ok
-2	nmda	42	1.703603	6.2	0.9862		6.6	400	0.31	3214.8	69	91	92	1492	75.28	170.00	sw_thermal	ok
-3	nmda_t	42	1.695829	6.2	1.2600		6.6	400	0.27	3216.4	79	92	91	1320	66.38	170.00	sw_thermal	ok
-4	baseline	43	1.706933	6.3			6.6	400	0.30	3259.9	72	91	92	1522	72.93	170.00	sw_thermal	ok
-5	nmda	43	1.705266	6.2	1.0315		6.6	400	0.26	3214.8	82	92	92	1320	71.45	170.00	sw_thermal	ok
-6	nmda_t	43	1.700385	6.2	1.2768		6.6	400	0.26	3216.4	83	92	92	1320	68.96	170.00	sw_thermal	ok
-7	baseline	44	1.706403	6.3			6.6	400	0.28	3259.9	77	92	91	1320	63.52	170.00	sw_thermal	ok
-8	nmda	44	1.708347	6.2	0.9875		6.6	400	0.26	3214.8	82	92	91	1320	67.21	170.00	sw_thermal	ok
-9	nmda_t	44	1.699100	6.2	1.2515		6.6	400	0.25	3216.4	85	92	92	1320	66.01	170.00	sw_thermal	ok
+1	baseline	42	1.508216	6.3			26.2	1600	0.33	3259.9	247	85	92	1507	73.05	170.00	sw_thermal	ok
+2	nmda_t	42	1.510072	6.2	0.8011		26.2	1600	0.25	3216.4	324	92	91	1320	66.44	170.00	sw_thermal	ok
+3	baseline	43	1.508972	6.3			26.2	1600	0.27	3259.9	299	92	92	1477	71.35	170.00	sw_thermal	ok
+4	nmda_t	43	1.509492	6.2	0.8009		26.2	1600	0.25	3216.4	327	92	91	1320	67.57	170.00	sw_thermal	ok
+5	baseline	44	1.508745	6.3			26.2	1600	0.28	3259.9	289	92	91	1320	66.97	170.00	sw_thermal	ok
+6	nmda_t	44	1.512202	6.2	0.7779		26.2	1600	0.25	3216.4	321	92	92	1320	66.71	170.00	sw_thermal	ok
