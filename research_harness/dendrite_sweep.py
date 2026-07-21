@@ -89,7 +89,7 @@ HARNESS = HERE / "train_harness.py"
 RESULTS_TSV = HERE / "dendrite_sweep_results.tsv"
 LOG_DIR = HERE / "sweep_logs"
 
-ALL_VARIANTS = ("baseline", "nmda", "compart", "tree")
+ALL_VARIANTS = ("baseline", "nmda", "nmda_t", "compart", "tree")
 
 # This card's own reported thresholds (nvidia-smi -q -d TEMPERATURE):
 #   Max Operating 93C  <- boost algorithm's target, normal under load
@@ -212,20 +212,29 @@ def warm_to_steady_state(seconds: int, target: int = 90) -> int | None:
     if not torch.cuda.is_available():
         return gpu_temperature()
 
-    print(f"  warming to steady state (<={seconds}s, target {target}C)...", flush=True)
+    print(f"  warming to {target}C (cap {seconds}s)...", flush=True)
     a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
     start = time.time()
-    while time.time() - start < seconds:
+    temp = gpu_temperature()
+    # Wait for the TARGET, not for the clock. Stopping at a fixed duration
+    # undershoots from a cold start: in the first sweep run 1 began at 45C and
+    # only reached 82C in 90s while runs 2-8 all started at 92-93C, handing
+    # run 1 ~20% more tokens in the same budget and biasing its variant.
+    while temp is None or temp < target:
         for _ in range(50):
             a = (a @ b).mul_(0.001)
         torch.cuda.synchronize()
         temp = gpu_temperature()
-        if temp is not None and temp >= target:
+        if time.time() - start > seconds:
+            print(
+                f"  !! only reached {temp}C in {seconds}s (target {target}C). "
+                "Raise --warmup; this run is not thermally matched.",
+                flush=True,
+            )
             break
     del a, b
     torch.cuda.empty_cache()
-    temp = gpu_temperature()
     print(f"  warmed to {temp}C in {time.time() - start:.0f}s", flush=True)
     return temp
 
@@ -292,47 +301,81 @@ def report(rows: list[dict[str, str]], variants: list[str], token_tol: float) ->
 
     # ---- Confound check FIRST. If the runs did unequal work, val_bpb is not
     # comparable and no amount of averaging fixes it.
-    tokens = [float(r["total_tokens_M"]) for r in ok if r.get("total_tokens_M")]
     comparable = True
-    if len(tokens) > 1 and statistics.mean(tokens) > 0:
-        spread = (max(tokens) - min(tokens)) / statistics.mean(tokens)
-        print("\n" + "=" * 72)
-        print("VALIDITY CHECK")
-        print("=" * 72)
+    print("\n" + "=" * 72)
+    print("VALIDITY CHECK")
+    print("=" * 72)
+
+    # Token spread has TWO causes and they mean opposite things:
+    #   (a) different variants run at different speeds -- expected, and an
+    #       honest property of the architecture under a fixed time budget;
+    #   (b) the SAME variant did different work on different seeds -- that is
+    #       thermal drift or another uncontrolled factor, and it is a confound.
+    # Only (b) invalidates the comparison. Testing overall spread conflates
+    # them and would condemn a sweep whose only "problem" is that one
+    # architecture is genuinely slower than another.
+    per_variant: dict[str, list[float]] = {}
+    for r in ok:
+        if r.get("total_tokens_M"):
+            per_variant.setdefault(r["variant"], []).append(float(r["total_tokens_M"]))
+
+    print("throughput by variant (fixed time budget => tokens ~ speed):")
+    worst_within = 0.0
+    for variant, toks in per_variant.items():
+        mean = statistics.mean(toks)
+        within = (max(toks) - min(toks)) / mean if len(toks) > 1 and mean else 0.0
+        worst_within = max(worst_within, within)
         print(
-            f"tokens processed: min={min(tokens):.1f}M max={max(tokens):.1f}M "
-            f"spread={spread:.1%} (tolerance {token_tol:.0%})"
+            f"  {variant:<10} {mean:>6.1f}M tokens  "
+            f"within-variant spread {within:>5.1%}"
         )
-        throttled = [r for r in ok if "thermal" in r.get("throttling_after", "")]
-        if throttled:
-            print(
-                f"thermal throttling observed in {len(throttled)}/{len(ok)} runs "
-                f"-- consider `sudo nvidia-smi -pl 130`"
-            )
-        # A power limit that changed mid-sweep invalidates the comparison just
-        # as thoroughly as thermal drift does.
-        limits = {r.get("power_limit_w", "") for r in ok if r.get("power_limit_w")}
-        if len(limits) > 1:
-            comparable = False
-            print(
-                f"\n!! POWER LIMIT CHANGED MID-SWEEP: saw {sorted(limits)} W.\n"
-                "!! `nvidia-smi -pl` does not survive a driver unload unless\n"
-                "!! persistence mode is on. Run `sudo nvidia-smi -pm 1`, reapply\n"
-                "!! the limit, and re-run -- these results are not comparable."
-            )
-        elif limits:
-            print(f"power limit: {limits.pop()}W, stable across all runs")
-        if spread > token_tol:
-            comparable = False
-            print(
-                "\n!! RUNS DID UNEQUAL WORK. With a fixed wall-clock budget this\n"
-                "!! usually means thermal throttling drifted across the sweep, so\n"
-                "!! val_bpb differences below are NOT safely attributable to the\n"
-                "!! architecture. Cap power/clocks and re-run before drawing a\n"
-                "!! conclusion."
-            )
-        else:
-            print("runs did comparable work -- val_bpb differences are interpretable")
+    print(
+        f"\nwithin-variant spread (the confound signal): {worst_within:.1%} "
+        f"(tolerance {token_tol:.0%})"
+    )
+    if worst_within > token_tol:
+        comparable = False
+        print(
+            "\n!! THE SAME VARIANT DID UNEQUAL WORK ACROSS SEEDS. That is\n"
+            "!! thermal drift or another uncontrolled factor, not architecture.\n"
+            "!! val_bpb below is NOT safely interpretable -- check that warm-up\n"
+            "!! reached target on every run, then re-run."
+        )
+    else:
+        print("each variant did consistent work across seeds -- no thermal confound")
+    if len(per_variant) > 1:
+        means = [statistics.mean(t) for t in per_variant.values()]
+        print(
+            f"\nBetween-variant throughput differs by {(max(means)-min(means))/max(means):.0%}. "
+            "Under a fixed TIME budget the slower variants also see fewer\n"
+            "tokens, so val_bpb here measures quality-per-second, not\n"
+            "quality-per-token. Re-run with MAX_STEPS to separate the two."
+        )
+
+    throttled = [r for r in ok if "thermal" in r.get("throttling_after", "")]
+    if throttled:
+        # Uniform throttling is fine -- it is equal for everyone. Only report
+        # it; do not recommend a power cap, which on this card costs ~12%
+        # throughput while the workload draws only ~70W and so is thermally,
+        # not power, limited.
+        print(
+            f"\nthermal throttling in {len(throttled)}/{len(ok)} runs "
+            "(uniform => comparable; the card is cooling-limited, not "
+            "power-limited)"
+        )
+    # A power limit that changed mid-sweep invalidates the comparison just as
+    # thoroughly as thermal drift does.
+    limits = {r.get("power_limit_w", "") for r in ok if r.get("power_limit_w")}
+    if len(limits) > 1:
+        comparable = False
+        print(
+            f"\n!! POWER LIMIT CHANGED MID-SWEEP: saw {sorted(limits)} W.\n"
+            "!! `nvidia-smi -pl` does not survive a driver unload unless\n"
+            "!! persistence mode is on. Run `sudo nvidia-smi -pm 1`, reapply\n"
+            "!! the limit, and re-run -- these results are not comparable."
+        )
+    elif limits:
+        print(f"power limit: {limits.pop()}W, stable across all runs")
 
     by_variant: dict[str, list[float]] = {}
     for r in ok:
@@ -441,6 +484,14 @@ def main() -> int:
         help="max fractional spread in tokens processed before results are "
         "declared non-comparable (default 5%%)",
     )
+    ap.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="fixed-TOKEN budget: give every variant this many steps instead "
+        "of a fixed wall-clock budget. Separates per-token quality from "
+        "throughput -- the decisive test when variants differ in speed.",
+    )
     ap.add_argument("--no-interleave", action="store_true", help="not recommended")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
@@ -485,6 +536,9 @@ def main() -> int:
                 return 1
 
     env_extra = {"OPTIMIZER": args.optimizer, "MUON_LR": args.muon_lr}
+    if args.max_steps:
+        env_extra["MAX_STEPS"] = str(args.max_steps)
+        print(f"budget:    FIXED TOKENS ({args.max_steps} steps/run)")
     rows: list[dict[str, str]] = []
 
     for i, (variant, seed) in enumerate(order, 1):

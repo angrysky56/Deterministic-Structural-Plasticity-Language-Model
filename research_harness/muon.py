@@ -85,13 +85,26 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 group["lr"] = group.get("lr", 0.02)
                 group["momentum"] = group.get("momentum", 0.95)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "momentum", "weight_decay", "use_muon"}
+                assert set(group.keys()) == {
+                    "params",
+                    "lr",
+                    "momentum",
+                    "weight_decay",
+                    "use_muon",
+                }
             else:
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
+                assert set(group.keys()) == {
+                    "params",
+                    "lr",
+                    "betas",
+                    "eps",
+                    "weight_decay",
+                    "use_muon",
+                }
         super().__init__(param_groups, dict())
 
     @torch.no_grad()
@@ -109,7 +122,9 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                    update = muon_update(
+                        p.grad, state["momentum_buffer"], beta=group["momentum"]
+                    )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
             else:
@@ -123,7 +138,12 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                         state["step"] = 0
                     state["step"] += 1
                     update = adam_update(
-                        p.grad, state["exp_avg"], state["exp_avg_sq"], state["step"], group["betas"], group["eps"]
+                        p.grad,
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                        state["step"],
+                        group["betas"],
+                        group["eps"],
                     )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])

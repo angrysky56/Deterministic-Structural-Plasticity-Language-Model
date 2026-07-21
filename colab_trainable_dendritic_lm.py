@@ -449,7 +449,7 @@ class ResonatorSSM(nn.Module):
 # ==========================================================================
 
 
-DENDRITE_VARIANTS = ("baseline", "nmda", "compart", "tree")
+DENDRITE_VARIANTS = ("baseline", "nmda", "nmda_t", "compart", "tree")
 
 
 def _branch_tree_distance(num_branches: int) -> torch.Tensor:
@@ -565,6 +565,7 @@ class DendriticMLP(nn.Module):
         gate_steepness: float = 10.0,
         variant: str = "baseline",
         lambda_init: float = 4.0,
+        nmda_window: int = 16,
     ) -> None:
         super().__init__()
         if variant not in DENDRITE_VARIANTS:
@@ -579,6 +580,26 @@ class DendriticMLP(nn.Module):
 
         self.value_proj = nn.Linear(d_model, self.d_ff)  # branch value vectors
         self.out_proj = nn.Linear(self.d_ff, d_model)  # soma integration
+
+        if variant == "nmda_t":
+            # NMDA kinetics as a difference of exponentials -- the same form
+            # Aizenbud et al. (2026) use for synaptic conductance (their
+            # Methods Eq. 5/6): g(t) ~ exp(-t/tau_d) - exp(-t/tau_r).
+            # Initialised to a short, asymmetric window (rise ~1 token, decay
+            # ~4) because NMDA rises fast and decays slowly; that asymmetry is
+            # what makes the branch sensitive to input ORDER, not just
+            # coincidence (Branco & Hausser, dendritic discrimination of
+            # temporal sequences -- ref 25/54 in the paper).
+            self.nmda_window = nmda_window
+            self.log_tau_rise = nn.Parameter(torch.zeros(num_branches))  # tau=1
+            self.log_tau_decay = nn.Parameter(
+                torch.full((num_branches,), math.log(4.0))
+            )
+            self.register_buffer(
+                "_kernel_t",
+                torch.arange(nmda_window, dtype=torch.float32),
+                persistent=False,
+            )
 
         if variant == "baseline":
             self.branch_gate = nn.Linear(d_model, num_branches)
@@ -635,6 +656,49 @@ class DendriticMLP(nn.Module):
             .to(dtype)
         )
 
+    def _nmda_kernel(self) -> torch.Tensor:
+        """Difference-of-exponentials NMDA conductance kernel, ``(nb, window)``.
+
+        Follows the synaptic form used in the biophysical models this is
+        derived from: ``g(t) ~ exp(-t/tau_decay) - exp(-t/tau_rise)``,
+        peak-normalised. Causal by construction (t >= 0 only). tau_decay is
+        held above tau_rise so the kernel stays positive and asymmetric --
+        fast rise, slow decay, the shape that makes the branch respond to
+        input ORDER rather than to a symmetric coincidence window.
+        """
+        t = self._kernel_t  # (window,)
+        tau_r = self.log_tau_rise.float().exp().clamp(min=0.5, max=64.0)
+        tau_d = self.log_tau_decay.float().exp().clamp(min=0.5, max=256.0)
+        tau_d = torch.maximum(tau_d, tau_r * 1.05)  # keep decay slower
+        k = torch.exp(-t[None, :] / tau_d[:, None]) - torch.exp(
+            -t[None, :] / tau_r[:, None]
+        )
+        return k / k.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    def _branch_drive(self, pre: torch.Tensor) -> torch.Tensor:
+        """Per-branch synaptic drive, ``(B, T, num_branches)``.
+
+        For ``nmda_t`` the drive is integrated over a causal time window with
+        NMDA kinetics rather than read off the current token. This is the
+        structural point: the neuron whose complexity this layer is imitating
+        is measured by a *temporally* convolutional network at 1 ms
+        resolution, and its supralinear threshold is crossed by inputs that
+        coincide within an NMDA time constant -- roughly tens of
+        milliseconds -- not within an instant. An instantaneous gate is a
+        transformer idiom wearing a biological name; this is the mechanism.
+        """
+        drive = pre.mean(dim=-1) * self._drive_scale  # (B, T, nb)
+        if self.variant != "nmda_t":
+            return drive
+        b, t, nb = drive.shape
+        kernel = self._nmda_kernel().to(drive.dtype)  # (nb, window)
+        # Depthwise causal conv over time: one kernel per branch, so this is
+        # (B, nb, T) not (B, d_ff, T) -- negligible next to value_proj.
+        x = drive.transpose(1, 2)  # (B, nb, T)
+        x = F.pad(x, (kernel.size(-1) - 1, 0))
+        out = F.conv1d(x, kernel.flip(-1).unsqueeze(1), groups=nb)
+        return out.transpose(1, 2)  # (B, T, nb)
+
     def _branch_gate_values(self, pre: torch.Tensor) -> torch.Tensor:
         """Self-gated NMDA nonlinearity from each branch's own drive.
 
@@ -645,7 +709,7 @@ class DendriticMLP(nn.Module):
             Gate in ``[0, 1)``, ``(B, T, num_branches)``. Unlike the baseline
             gate this reaches 0, so a branch can actually be silenced.
         """
-        drive = pre.mean(dim=-1) * self._drive_scale  # (B, T, nb)
+        drive = self._branch_drive(pre)
         k = self.gate_log_k.exp()  # positive steepness
         return torch.sigmoid(k * (drive - self.gate_theta))
 
@@ -706,6 +770,9 @@ class DendriticMLP(nn.Module):
             out["gate_k_mean"] = float(self.gate_log_k.exp().mean())
             out["gate_k_max"] = float(self.gate_log_k.exp().max())
             out["gate_theta_mean"] = float(self.gate_theta.mean())
+        if self.variant == "nmda_t":
+            out["tau_rise_mean"] = float(self.log_tau_rise.exp().mean())
+            out["tau_decay_mean"] = float(self.log_tau_decay.exp().mean())
         if self.variant in ("compart", "tree"):
             out["lambda"] = float(self.log_lambda.exp())
         if self.variant == "tree":

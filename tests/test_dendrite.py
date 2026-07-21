@@ -122,6 +122,89 @@ def test_new_variants_have_no_dead_gate_at_init(variant):
 
 
 # ---------------------------------------------------------------------------
+# Temporal NMDA kinetics (nmda_t)
+# ---------------------------------------------------------------------------
+
+
+def test_nmda_kernel_has_epsp_shape():
+    """Difference of exponentials: zero at t=0, single peak, monotone decay.
+
+    This is the synaptic conductance form used in the biophysical models
+    (Aizenbud et al. 2026, Methods Eq. 5/6), not an arbitrary smoothing
+    window.
+    """
+    k = _layer("nmda_t")._nmda_kernel().detach()
+    assert k.shape == (NUM_BRANCHES, 16)
+    row = k[0]
+    assert abs(float(row[0])) < 1e-6, "conductance must start at zero"
+    peak = int(row.argmax())
+    assert 0 < peak < 5, f"peak should be early, got t={peak}"
+    tail = row[peak:]
+    assert torch.all(tail[1:] <= tail[:-1] + 1e-6), "decay must be monotone"
+    assert math.isclose(float(row.sum()), 1.0, rel_tol=1e-4)
+
+
+def test_nmda_kernel_is_asymmetric_fast_rise_slow_decay():
+    """Asymmetry is what makes a branch sensitive to input ORDER."""
+    row = _layer("nmda_t")._nmda_kernel().detach()[0]
+    peak = int(row.argmax())
+    rise = float(row[: peak + 1].sum())
+    decay = float(row[peak + 1 :].sum())
+    assert decay > rise, "decay tail should carry more mass than the rise"
+
+
+def test_nmda_t_drive_is_causal():
+    """A token must never influence the drive at an earlier position.
+
+    Tested by perturbation rather than by looking for a flat prefix: the first
+    few positions legitimately differ from each other because the causal
+    convolution pads with zeros and history ramps up. Causality is the claim
+    that changing token t leaves every position < t untouched.
+    """
+    layer = _layer("nmda_t")
+    x = torch.randn(1, 12, D_MODEL)
+    perturbed = x.clone()
+    perturbed[0, 6] += 9.0
+
+    with torch.no_grad():
+        shape = (1, 12, NUM_BRANCHES, BRANCH_DIM)
+        before = layer._branch_drive(layer.value_proj(x).view(*shape))
+        after = layer._branch_drive(layer.value_proj(perturbed).view(*shape))
+
+    assert torch.allclose(before[:, :6], after[:, :6], atol=1e-6), (
+        "perturbing token 6 changed the drive before it -- convolution leaked "
+        "backwards"
+    )
+    assert not torch.allclose(
+        before[:, 7:], after[:, 7:], atol=1e-4
+    ), "perturbing token 6 had no forward effect -- the window is not working"
+
+
+def test_nmda_t_gate_depends_on_context_not_current_token():
+    """g(0)=0 for a difference of exponentials, so the gate reads only history.
+
+    Deliberate, and the same motif as Numenta's active dendrites: recent
+    context gates the current token's value rather than the token gating
+    itself. Pinned because it is a real behavioural property, not an accident.
+    """
+    layer = _layer("nmda_t")
+    pre = torch.zeros(1, 6, NUM_BRANCHES, BRANCH_DIM)
+    quiet = layer._branch_gate_values(pre)[0, -1].clone()
+    pre[0, -1] = 9.0  # blast the CURRENT token only
+    assert torch.allclose(quiet, layer._branch_gate_values(pre)[0, -1], atol=1e-6)
+
+
+def test_nmda_t_decay_stays_slower_than_rise():
+    """Kernel must stay positive even if the optimiser pushes tau_rise up."""
+    layer = _layer("nmda_t")
+    with torch.no_grad():
+        layer.log_tau_rise.fill_(math.log(50.0))  # invert the intended order
+        layer.log_tau_decay.fill_(math.log(0.6))
+    k = layer._nmda_kernel().detach()
+    assert torch.all(k >= -1e-6), "kernel went negative; clamp failed"
+
+
+# ---------------------------------------------------------------------------
 # Tree geometry and the tail-up decay mask
 # ---------------------------------------------------------------------------
 

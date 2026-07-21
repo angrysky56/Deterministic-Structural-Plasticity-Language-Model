@@ -362,6 +362,18 @@ D_MODEL_BASE = 256  # muP reference width -- this run IS the base-width sweep
 # Dendrite mechanism -- override with DENDRITE=<baseline|nmda|compart|tree>.
 # Default stays 'baseline' so every prior number in results.tsv reproduces.
 DENDRITE_VARIANT = os.environ.get("DENDRITE", "baseline")
+# MAX_STEPS switches the budget from fixed WALL-CLOCK to fixed TOKENS.
+#
+# The default time budget answers "best model per GPU-minute", which is the
+# right question for hyperparameter search but the wrong one for an
+# architecture ablation: a mechanism that costs 20% throughput processes 20%
+# fewer tokens and scores worse even if it is better per token. Those are
+# different claims and the fixed-time metric cannot separate them.
+#
+# Set MAX_STEPS=N to give every variant identical tokens (N * TOTAL_BATCH_SIZE)
+# regardless of how long it takes. Slower variants then simply take longer,
+# and val_bpb reflects per-token quality alone.
+MAX_STEPS = int(os.environ.get("MAX_STEPS", 0))
 
 # Optimization
 TOTAL_BATCH_SIZE = (
@@ -460,7 +472,13 @@ else:
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
+if MAX_STEPS:
+    print(
+        f"Budget: FIXED TOKENS -- {MAX_STEPS} steps "
+        f"({MAX_STEPS * TOTAL_BATCH_SIZE / 1e6:.1f}M tokens), no time limit"
+    )
+else:
+    print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 
@@ -494,7 +512,15 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    # Progress drives the LR schedule. Under MAX_STEPS it must track steps,
+    # not wall-clock, or a slower variant would decay its LR early and be
+    # penalised for its speed all over again -- the exact confound the
+    # fixed-token mode exists to remove.
+    progress = (
+        min(step / MAX_STEPS, 1.0)
+        if MAX_STEPS
+        else min(total_training_time / TIME_BUDGET, 1.0)
+    )
     lrm = get_lr_multiplier(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
@@ -539,7 +565,10 @@ while True:
 
     step += 1
 
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if MAX_STEPS:
+        if step >= MAX_STEPS:
+            break
+    elif step > 10 and total_training_time >= TIME_BUDGET:
         break
 
 print()  # newline after \r training log
